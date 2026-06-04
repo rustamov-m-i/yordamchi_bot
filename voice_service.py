@@ -28,6 +28,8 @@ import io
 import logging
 import socket
 import ssl
+import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -52,7 +54,48 @@ WHISPER_TIMEOUT = 45.0
 # ~3KB. Below this we skip the (paid) STT round-trip entirely.
 _SILENCE_BYTES_THRESHOLD = 2 * 1024
 
-_CA_BUNDLE = certifi.where()
+def _build_ca_bundle() -> str:
+    """Verify target for STT requests.
+
+    The Uzbek STT hosts (back.aisha.group, service.muxlisa.uz) sit behind a
+    corporate SSL-inspection proxy that re-signs TLS with a private root which
+    is NOT in certifi. With plain certifi, httpx fails every Aisha/Muxlisa call
+    with CERTIFICATE_VERIFY_FAILED ("self-signed certificate in chain") and the
+    bot silently falls back to Whisper — which transcribes Uzbek poorly, so
+    voice "isn't understood". Fix WITHOUT disabling verification: trust the
+    OS-installed roots too by merging certifi with the system keychain (macOS),
+    written to a file httpx can use as `verify`. Falls back to certifi on any
+    error or unsupported platform (Linux already exposes corporate roots via the
+    system bundle when present).
+    """
+    try:
+        bundle = certifi.contents()
+        if sys.platform == "darwin":
+            extra = []
+            for kc in ("/Library/Keychains/System.keychain",
+                       "/System/Library/Keychains/SystemRootCertificates.keychain"):
+                try:
+                    out = subprocess.run(
+                        ["security", "find-certificate", "-a", "-p", kc],
+                        capture_output=True, text=True, timeout=15,
+                    )
+                    if out.returncode == 0 and "BEGIN CERTIFICATE" in out.stdout:
+                        extra.append(out.stdout)
+                except Exception:
+                    pass
+            if extra:
+                bundle = bundle + "\n" + "\n".join(extra)
+        out_path = Path(config.DATABASE_PATH).parent / "ca_bundle.pem"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(bundle)
+        logger.info("CA bundle: %d certs (%s)", bundle.count("BEGIN CERTIFICATE"), out_path)
+        return str(out_path)
+    except Exception:
+        logger.exception("CA bundle build failed — using certifi only")
+        return certifi.where()
+
+
+_CA_BUNDLE = _build_ca_bundle()
 
 # Muxlisa's TLS endpoint is signed by a private CA ("bBakh") absent from every public
 # trust store, so verification against certifi always fails. We pin the leaf cert

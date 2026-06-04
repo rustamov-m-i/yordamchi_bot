@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module="caldav")
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import BotCommand, MenuButtonDefault
+from aiogram.types import BotCommand, ErrorEvent, MenuButtonDefault
 
 import config
 import database
@@ -41,8 +41,7 @@ async def _register_bot_commands(bot: Bot) -> None:
         BotCommand(command="today", description="📅 Bugungi briefing"),
         BotCommand(command="tasks", description="📌 Vazifalar"),
         BotCommand(command="reminders", description="⏰ Eslatmalar"),
-        BotCommand(command="notes", description="📝 Qaydlar (Inbox)"),
-        BotCommand(command="qayd", description="📥 Tezkor qayd qo'shish"),
+        BotCommand(command="notes", description="📝 Notes (Inbox)"),
         BotCommand(command="team", description="👥 Ijrochilar paneli"),
         BotCommand(command="risks", description="🚨 Risklar paneli"),
         BotCommand(command="new", description="➕ Yangi vazifa"),
@@ -125,6 +124,35 @@ async def main() -> None:
         logger.info("Purged %d stale FSM rows (>24h)", purged_fsm)
     dispatcher = Dispatcher(storage=fsm)
     dispatcher.include_router(handlers.router)
+
+    @dispatcher.errors()
+    async def _on_unhandled_error(event: ErrorEvent) -> bool:
+        """Catch-all safety net: any handler exception not handled locally lands
+        here. Log it AND tell the user something went wrong — without this, an
+        unexpected error leaves the user staring at silence."""
+        logger.exception("Unhandled update error", exc_info=event.exception)
+        chat_id = None
+        upd = event.update
+        try:
+            if getattr(upd, "message", None):
+                chat_id = upd.message.chat.id
+            elif getattr(upd, "callback_query", None) and upd.callback_query.message:
+                chat_id = upd.callback_query.message.chat.id
+                try:
+                    await upd.callback_query.answer("⚠️ Texnik xato")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if chat_id is not None:
+            try:
+                await bot.send_message(
+                    chat_id,
+                    "⚠️ Texnik xato yuz berdi. Iltimos, qaytadan urinib ko'ring.",
+                )
+            except Exception:
+                logger.debug("Could not deliver error notice to user")
+        return True  # handled — stop propagation
 
     await _register_bot_commands(bot)
     await _clear_menu_button(bot)

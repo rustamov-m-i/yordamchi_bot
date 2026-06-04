@@ -93,6 +93,9 @@ def hash_input(text: str) -> str:
 
 # Rough USD pricing as of mid-2025 (per-million tokens). Update if rates change.
 _PRICES_USD_PER_MTOK = {
+    # Opus 4.8 pricing assumed equal to Opus 4.7 ($15/$75 per Mtok). Adjust here
+    # if the official Opus 4.8 rate differs.
+    "claude-opus-4-8":     {"in": 15.0, "out": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
     "claude-opus-4-7":     {"in": 15.0, "out": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
     "claude-sonnet-4-6":   {"in": 3.0,  "out": 15.0, "cache_read": 0.3,  "cache_write": 3.75},
     "claude-sonnet-4-5":   {"in": 3.0,  "out": 15.0, "cache_read": 0.3,  "cache_write": 3.75},

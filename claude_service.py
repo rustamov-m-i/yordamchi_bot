@@ -3,7 +3,7 @@
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import AsyncIterator, Optional, Tuple
 
 from anthropic import (
@@ -116,11 +116,29 @@ def _pick_model(complexity: Optional[str], internal_directive: Optional[str]) ->
 
 
 async def _build_state_block() -> str:
-    """Dynamic state snapshot — appended after the cached system prompt."""
+    """Dynamic, DB-backed snapshot appended after the cached system prompt.
+
+    Covers ALL four sections (tasks, meetings, reminders, notes) so Claude can
+    answer questions about them from REAL data instead of guessing. It is a
+    capped snapshot, not the full database — when the principal wants a complete
+    list, Claude must emit a show_* action (see output contract) rather than
+    enumerate from here. Claude must NEVER invent items beyond what's listed."""
     now = datetime.now(database.TZ)
-    today_tasks = await database.list_today_tasks()
-    today_meetings = await database.list_today_meetings()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    active_tasks = await database.list_tasks(status_in=["todo", "in_progress", "blocked"], limit=200)
     overdue = await database.list_overdue_tasks()
+    today_tasks = await database.list_today_tasks()
+    done_today = await database.list_tasks_done_today()
+    today_meetings = await database.list_today_meetings()
+    week_meetings = [
+        m for m in await database.list_meetings_in_window(
+            today_start.isoformat(), (today_start + timedelta(days=7)).isoformat())
+        if not m.get("completed_at")
+    ]
+    reminders = await database.list_reminders(status_in=["scheduled"], limit=20)
+    notes_inbox = await database.count_notes_in_status("inbox")
+    recent_notes = await database.list_notes(status="inbox", limit=8)
     contacts = await database.list_contacts()
     corrections = await database.list_recent_corrections(limit=5)
 
@@ -131,37 +149,53 @@ async def _build_state_block() -> str:
     def meeting_line(m: dict) -> str:
         return f"  - {m['datetime_start']} — {m['title']} (participants: {', '.join(m.get('participants', []))}, id: {m['id']})"
 
+    def reminder_line(r: dict) -> str:
+        return f"  - {r.get('remind_at')} — {r.get('title')} (id: {r.get('id')})"
+
+    def note_line(n: dict) -> str:
+        return f"  - {n.get('title') or (n.get('content') or '')[:50]} (id: {n.get('id')})"
+
     def contact_line(c: dict) -> str:
         return f"  - {c['name']} (role: {c.get('role') or 'unknown'}, formality: {c.get('formality_level', 3)})"
 
     def correction_line(c: dict) -> str:
         return f"  - {c.get('correction', '')[:120]} (reason: {c.get('reason', '')[:80]})"
 
+    blocked = sum(1 for t in active_tasks if t.get("status") == "blocked")
     lines = [
-        "# CURRENT PRINCIPAL STATE",
+        "# CURRENT PRINCIPAL STATE (real DB snapshot — do NOT invent anything beyond this)",
         "",
         f"current_datetime: {now.isoformat()}",
         f"current_weekday: {now.strftime('%A')}",
         "",
-        f"today_tasks ({len(today_tasks)}):",
-        *(task_line(t) for t in today_tasks[:15]),
-        "" if today_tasks else "  (none)",
+        "## COUNTS",
+        f"tasks: active={len(active_tasks)}, overdue={len(overdue)}, due_today={len(today_tasks)}, "
+        f"blocked={blocked}, done_today={len(done_today)}",
+        f"meetings: today={len(today_meetings)}, this_week={len(week_meetings)}",
+        f"reminders_scheduled: {len(reminders)}",
+        f"notes_inbox: {notes_inbox}",
         "",
-        f"today_meetings ({len(today_meetings)}):",
-        *(meeting_line(m) for m in today_meetings[:10]),
-        "" if today_meetings else "  (none)",
-        "",
-        f"overdue_tasks ({len(overdue)}):",
+        f"## ACTIVE TASKS ({len(active_tasks)} total, showing up to 25)",
+        *(task_line(t) for t in active_tasks[:25]),
+        "  (none)" if not active_tasks else "",
+        f"## OVERDUE TASKS ({len(overdue)})",
         *(task_line(t) for t in overdue[:10]),
-        "" if overdue else "  (none)",
-        "",
-        f"recent_contacts ({len(contacts)}):",
+        "  (none)" if not overdue else "",
+        f"## MEETINGS — today + this week ({len(week_meetings)})",
+        *(meeting_line(m) for m in week_meetings[:12]),
+        "  (none)" if not week_meetings else "",
+        f"## SCHEDULED REMINDERS ({len(reminders)})",
+        *(reminder_line(r) for r in reminders[:12]),
+        "  (none)" if not reminders else "",
+        f"## NOTES INBOX ({notes_inbox} unprocessed, showing up to 8)",
+        *(note_line(n) for n in recent_notes[:8]),
+        "  (none)" if not recent_notes else "",
+        f"## CONTACTS ({len(contacts)})",
         *(contact_line(c) for c in contacts[:15]),
-        "" if contacts else "  (none)",
-        "",
-        f"recent_style_corrections ({len(corrections)}):",
+        "  (none)" if not contacts else "",
+        f"## STYLE CORRECTIONS ({len(corrections)})",
         *(correction_line(c) for c in corrections),
-        "" if corrections else "  (none)",
+        "  (none)" if not corrections else "",
     ]
     return "\n".join(lines)
 
@@ -235,6 +269,26 @@ def _fallback(user_message: str) -> dict:
 _FALLBACK_RESPONSE = _fallback("Texnik xato yuz berdi. Iltimos, qaytadan urinib ko'ring.")
 
 
+def _envelope_from_raw(raw: str) -> Optional[dict]:
+    """Turn Claude's raw output into a response envelope.
+
+    Normally Claude returns the JSON envelope. But for trivial conversational
+    inputs ("Salom", "ha", "rahmat") it sometimes replies in PLAIN TEXT. Rather
+    than surfacing a "Texnik xato", treat such a reply as a normal user_message
+    so the user just sees Claude's answer. Returns None only when the output is
+    genuinely unusable (empty, or a broken JSON attempt) — the caller then uses
+    _FALLBACK_RESPONSE.
+    """
+    parsed = _extract_json(raw)
+    if parsed:
+        return parsed
+    text = (raw or "").strip()
+    if text and "{" not in text and "}" not in text:
+        # Pure prose — Claude chatted instead of emitting JSON. Show it verbatim.
+        return _fallback(text)
+    return None
+
+
 async def process_message(
     user_text: str,
     internal_directive: Optional[str] = None,
@@ -260,9 +314,17 @@ async def process_message(
     model = _pick_model(complexity, internal_directive)
     state_block = await _build_state_block()
 
-    history = await database.recent_messages(limit=10)
-    history = _budget_history(history)
-    messages = [{"role": m["role"], "content": m["content"]} for m in history]
+    # Conversation history is included ONLY for the interactive user path.
+    # Internal directives (briefings, summaries, proactive checks) must rely
+    # SOLELY on the structured state block — otherwise Claude treats things the
+    # user merely MENTIONED in chat (but never saved) as real tasks/meetings and
+    # fabricates them into briefings (reported bug: phantom "overdue tasks").
+    if internal_directive:
+        messages = []
+    else:
+        history = await database.recent_messages(limit=10)
+        history = _budget_history(history)
+        messages = [{"role": m["role"], "content": m["content"]} for m in history]
 
     # Redact PII for BOTH user messages and internal directives. Internal directives
     # are generated server-side but may interpolate state (task titles, meeting
@@ -359,9 +421,9 @@ async def process_message(
         redacted_terms_count=redacted_count, estimated_cost_usd=cost,
     )
 
-    parsed = _extract_json(raw)
+    parsed = _envelope_from_raw(raw)
     if not parsed:
-        logger.error("Claude returned non-JSON output: %s", raw[:500])
+        logger.error("Claude returned unusable output: %s", raw[:500])
         return _FALLBACK_RESPONSE
 
     parsed.setdefault("intent", "none")
@@ -465,9 +527,9 @@ async def process_message_stream(
         redacted_terms_count=redacted_count, estimated_cost_usd=cost,
     )
 
-    parsed = _extract_json(raw)
+    parsed = _envelope_from_raw(raw)
     if not parsed:
-        logger.error("Claude (stream) returned non-JSON output: %s", raw[:500])
+        logger.error("Claude (stream) returned unusable output: %s", raw[:500])
         yield ("complete", _FALLBACK_RESPONSE)
         return
 
