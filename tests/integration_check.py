@@ -163,6 +163,87 @@ async def main():
     except Exception as e:
         check("executive_stats xatosiz ishlaydi", False, f"{type(e).__name__}: {e}")
 
+    print("\n── Export / Import (Excel) ──")
+    import io as _io
+    from openpyxl import load_workbook as _lwb
+
+    class _ExpMsg:
+        chat = type("C", (), {"id": 1})()
+        captured = {}
+        async def answer_document(self, file, caption=None, parse_mode=None):
+            _ExpMsg.captured["b"] = file.data
+        async def answer(self, *a, **k):
+            _ExpMsg.captured["t"] = a
+
+    await database.create_task({"title": "Export sinov", "assignee": "J.K", "priority": "P0",
+                                "status": "todo", "deadline": (datetime.now(TZ) + timedelta(days=2)).isoformat(),
+                                "description": "izoh"})
+    await handlers.cmd_export(_ExpMsg())
+    try:
+        _ws = _lwb(_io.BytesIO(_ExpMsg.captured["b"])).active
+        check("Export: xlsx yaratildi", _ExpMsg.captured.get("b") is not None)
+        check("Export: sarlavha B1", _ws["B1"].value == "VAZIFALAR RO'YXATI")
+        check("Export: header A3=№ B3=Vazifa", _ws["A3"].value == "№" and _ws["B3"].value == "Vazifa")
+        check("Export: header Arial 14", _ws["B3"].font.name == "Arial" and int(_ws["B3"].font.sz) == 14)
+        check("Export: yashirin ID ustuni (H)", _ws["H3"].value == "ID" and bool(_ws.column_dimensions["H"].hidden))
+    except Exception as e:
+        check("Export: xlsx tahlili", False, f"{type(e).__name__}: {e}")
+
+    _acts = handlers._structured_tasks_from_table(
+        [("№", "Vazifa", "Ijrochi", "Muddat", "Ustuvorlik", "Holat", "Izoh"),
+         (1, "Import A", "Aziz", "08-06-2026", "Shoshilinch", "Aktiv", "x")])
+    check("Import (struktura): 1 vazifa", len(_acts) == 1 and _acts[0]["data"]["title"] == "Import A")
+    check("Import: Shoshilinch→P0", bool(_acts) and _acts[0]["data"]["priority"] == "P0")
+    check("Import: noma'lum ustun → [] (aqlli yo'lga)", handlers._structured_tasks_from_table([("Mahsulot", "Narx", "Soni"), ("Olma", "5000", "10")]) == [])
+    check("Import: Mas'ul ustuni → ijrochi", (lambda a: bool(a) and a[0]["data"].get("assignee") == "O.X")(handlers._structured_tasks_from_table([("Vazifa", "Mas'ul"), ("Ish", "O.X")])))
+    check("Import: izoh==ijrochi → izoh tushiriladi", (lambda a: bool(a) and not a[0]["data"].get("description"))(handlers._structured_tasks_from_table([("Vazifa", "Ijrochi", "Izoh"), ("Ish", "Aziz", "Aziz")])))
+
+    print("\n── Import round-trip dedup (yangilash, dublikat emas) ──")
+    _t = await database.create_task({"title": "Dedup sinov", "priority": "P2", "status": "todo"})
+    _a2 = handlers._structured_tasks_from_table(
+        [("№", "Vazifa", "Ijrochi", "Muddat", "Ustuvorlik", "Holat", "Izoh", "ID"),
+         (1, "Dedup YANGI", "Dilshod", "", "Muhim", "Aktiv", "", _t)])
+    check("Import: ID ustuni o'qiladi", bool(_a2) and _a2[0].get("_id") == _t)
+    for _a in _a2:
+        _rid = _a.pop("_id", "")
+        if _rid and await database.get_task(_rid):
+            _a["type"] = "update_task"; _a["id"] = _rid
+    check("Import dedup: mavjud ID → update_task", _a2[0]["type"] == "update_task")
+    await handlers._execute_actions(_a2)
+    _cnt = len([t for t in await database.list_tasks(limit=999) if t["title"] in ("Dedup sinov", "Dedup YANGI")])
+    _upd = await database.get_task(_t)
+    check("Import dedup: yangilandi, dublikat YO'Q", _cnt == 1 and _upd["title"] == "Dedup YANGI" and _upd["assignee"] == "Dilshod", f"cnt={_cnt}")
+
+    # Title-based dedup (covers files with NO hidden ID + smart-extracted PDFs)
+    _bt = {(t.get("title") or "").strip().lower(): t["id"]
+           for t in await database.list_tasks(status_in=["todo", "in_progress", "blocked"], limit=999)
+           if t.get("title")}
+    _new = [{"type": "create_task", "data": {"title": "Dedup YANGI", "priority": "P0"}},
+            {"type": "create_task", "data": {"title": "Mutlaqo yangi XYZ", "priority": "P2"}}]
+    _conv = handlers._apply_title_dedup(_new, _bt)
+    check("Title dedup: mavjud sarlavha → update", _new[0]["type"] == "update_task" and _conv == 1)
+    check("Title dedup: yangi sarlavha → create", _new[1]["type"] == "create_task")
+
+    print("\n── _humanize_error (aniq sabab) ──")
+    check("humanize: tarmoq", "ulanish" in handlers._humanize_error(Exception("Cannot connect [Network is unreachable]")).lower())
+    check("humanize: bo'sh xabar", "bo'sh xabar" in handlers._humanize_error(Exception("messages.8: user messages must have non-empty content")).lower())
+    check("humanize: noma'lum → tur ko'rsatiladi", "ValueError" in handlers._humanize_error(ValueError("nimadir")))
+
+    print("\n── Ikonka birligi (list ↔ batafsil) ──")
+    _p2 = {"title": "P2 sinov", "priority": "P2", "status": "todo", "deadline": None}
+    check("Badge: P2 list=batafsil bir xil", handlers._format_task_detail_card(_p2).startswith(handlers._task_badge(_p2)))
+
+    print("\n── /delegations so'rovi xatosiz ──")
+    try:
+        import aiosqlite as _sq
+        async with _sq.connect(config.DATABASE_PATH) as _db:
+            await _db.execute("SELECT * FROM tasks WHERE status IN ('todo','in_progress') "
+                              "AND assignee IS NOT NULL AND LOWER(TRIM(assignee)) NOT IN "
+                              "('','men','siz','belgilanmagan','—','oʻzim','o''zim','o''z','ozim') LIMIT 5")
+        check("/delegations SQL ishlaydi", True)
+    except Exception as e:
+        check("/delegations SQL ishlaydi", False, f"{type(e).__name__}: {e}")
+
     print("\n" + "=" * 48)
     print(f"NATIJA:  ✅ {PASS} o'tdi   ❌ {FAIL} yiqildi")
     if FAILED:

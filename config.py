@@ -49,8 +49,8 @@ CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6").strip()
 # simple intent classification). ~70% cheaper than Sonnet.
 CLAUDE_MODEL_FAST: str = os.getenv("CLAUDE_MODEL_FAST", "claude-haiku-4-5").strip()
 # Premium model reserved for long-form planning and high-judgement directives
-# (executive_plan, check_followups). Used sparingly; ~5x cost of Sonnet.
-CLAUDE_MODEL_COMPLEX: str = os.getenv("CLAUDE_MODEL_COMPLEX", "claude-opus-4-7").strip()
+# (executive_plan). Used sparingly; ~5x cost of Sonnet.
+CLAUDE_MODEL_COMPLEX: str = os.getenv("CLAUDE_MODEL_COMPLEX", "claude-opus-4-8").strip()
 
 OPENAI_API_KEY: str = _require("OPENAI_API_KEY")
 WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "whisper-1").strip()

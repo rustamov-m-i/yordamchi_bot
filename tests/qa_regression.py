@@ -338,8 +338,8 @@ def test_model_router():
       claude_service._pick_model(None, None) == config.CLAUDE_MODEL)
     t("router", "no hint, 'executive_plan' directive → Opus",
       claude_service._pick_model(None, "[INTERNAL] executive_plan blah") == config.CLAUDE_MODEL_COMPLEX)
-    t("router", "no hint, 'check_followups' directive → Opus",
-      claude_service._pick_model(None, "[INTERNAL] check_followups blah") == config.CLAUDE_MODEL_COMPLEX)
+    t("router", "no hint, 'check_followups' directive → Sonnet (moved off Opus for cost)",
+      claude_service._pick_model(None, "[INTERNAL] check_followups blah") == config.CLAUDE_MODEL)
     t("router", "no hint, ordinary directive → Sonnet",
       claude_service._pick_model(None, "[INTERNAL] generate_morning_briefing") == config.CLAUDE_MODEL)
     t("router", "explicit hint overrides directive",
@@ -438,7 +438,7 @@ def test_voice_and_create_confirm_settings():
       database.DEFAULT_SETTINGS["confirm_create_actions"] is True)
 
 
-def test_create_action_preview_format():
+async def test_create_action_preview_format():
     """Phase: _format_create_preview renders task + meeting cards correctly."""
     section("14. _format_create_preview — task + meeting rendering")
     actions = [
@@ -456,7 +456,7 @@ def test_create_action_preview_format():
         }},
         {"type": "save_contact", "data": {"name": "Should be skipped"}},
     ]
-    preview = handlers._format_create_preview(
+    preview = await handlers._format_create_preview(
         [a for a in actions if a["type"] in handlers._DESTRUCTIVE_ACTION_TYPES]
     )
     t("preview", "header present", "TASDIQLAYSIZMI" in preview)
@@ -853,7 +853,7 @@ async def main():
     await test_silence_detection()
     await test_aisha_provider_chain()
     test_voice_and_create_confirm_settings()
-    test_create_action_preview_format()
+    await test_create_action_preview_format()
     test_destructive_action_types()
     await test_today_tasks_strict_deadline_filter()
     test_maybe_refresh_section_present()

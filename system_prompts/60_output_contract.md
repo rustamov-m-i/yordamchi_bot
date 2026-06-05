@@ -43,6 +43,7 @@ You MUST respond with EXACTLY ONE valid JSON object. No markdown code fences. No
 | `show_notes` | — |
 | `show_reminders` | — |
 | `show_contacts` | — |
+| `export_tasks` | — (export ALL tasks to an Excel file the app sends as a document) |
 | `none` | (empty data — used for polish-only or info responses) |
 
 ### Button callback patterns
@@ -98,3 +99,8 @@ You MUST respond with EXACTLY ONE valid JSON object. No markdown code fences. No
     you don't see, done/historical data), emit the right `show_*` action OR say
     you'll pull it up — do NOT guess. When unsure whether an item exists, show or
     ask; never assert. An empty section means there is genuinely nothing there.
+12. **Export requests.** When the principal asks to export / download / get a file
+    of tasks — "vazifalarni eksport qil", "excelga chiqar", "faylga yuklab ber",
+    "ro'yxatni excel qilib ber" — emit a single `export_tasks` action (no data) and
+    a one-line `user_message` like "Tayyorlayapman…". The app builds and sends the
+    Excel file. Do NOT try to list tasks yourself for an export request.

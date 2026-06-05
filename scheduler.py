@@ -343,6 +343,24 @@ class YordamchiScheduler:
             await self._send(text)
 
     async def _followup_check(self) -> None:
+        # A proactive follow-up is a nag the principal reads later — there is never
+        # a reason to GENERATE one overnight, and _send would suppress it during
+        # quiet hours / when notifications are off anyway. Skip the paid LLM call
+        # entirely in those cases instead of paying to produce a message we'd drop.
+        # (Fixed 22:00–08:00 sleep window is checked IN ADDITION to quiet hours,
+        # which may be disabled in settings yet a 3 AM follow-up is still useless.)
+        hour = datetime.now(database.TZ).hour
+        if hour >= 22 or hour < 8:
+            logger.info("Skipping follow-up check during sleep hours (%02d:00 local)", hour)
+            return
+        try:
+            settings = await database.get_settings()
+            if not settings.get("notifications_enabled", True) or self._in_quiet_hours(settings):
+                logger.info("Skipping follow-up check — message would be suppressed")
+                return
+        except Exception:
+            logger.exception("Follow-up check: settings read failed; proceeding")
+
         logger.info("Running follow-up check")
         response = await claude_service.process_message(
             "",

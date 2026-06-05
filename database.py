@@ -939,7 +939,10 @@ async def list_delegated_open_tasks(limit: int = 20) -> list[dict]:
             """SELECT * FROM tasks
                WHERE status IN ('todo','in_progress')
                  AND assignee IS NOT NULL
-                 AND TRIM(LOWER(assignee)) NOT IN ('', 'men', 'oʻzim', 'ozim')
+                 AND LOWER(TRIM(assignee)) NOT IN (
+                     '', 'men', 'siz', 'belgilanmagan', '—',
+                     'oʻzim', 'o''zim', 'o''z', 'ozim'
+                 )
                ORDER BY
                  CASE WHEN deadline IS NULL THEN 1 ELSE 0 END,
                  deadline ASC
@@ -1844,7 +1847,10 @@ async def executive_stats(days: int = 7) -> dict:
                FROM tasks
                WHERE status IN ('todo','in_progress')
                  AND assignee IS NOT NULL
-                 AND TRIM(LOWER(assignee)) NOT IN ('', 'men', 'oʻzim', 'ozim')
+                 AND LOWER(TRIM(assignee)) NOT IN (
+                     '', 'men', 'siz', 'belgilanmagan', '—',
+                     'oʻzim', 'o''zim', 'o''z', 'ozim'
+                 )
                GROUP BY assignee ORDER BY total DESC LIMIT 8""",
             (now.isoformat(),),
         )
@@ -2246,29 +2252,6 @@ async def list_recent_plans(limit: int = 10) -> list[dict]:
             (limit,),
         )
         return [dict(r) for r in await cur.fetchall()]
-
-
-async def list_plans_due_followup() -> list[dict]:
-    """Plans created 48h ago that haven't had follow-up yet."""
-    cutoff = (datetime.now(TZ) - timedelta(hours=48)).isoformat()
-    async with aiosqlite.connect(config.DATABASE_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            """SELECT * FROM plans
-               WHERE created_at <= ? AND follow_up_asked_at IS NULL AND accepted = 1
-               ORDER BY created_at ASC LIMIT 5""",
-            (cutoff,),
-        )
-        return [dict(r) for r in await cur.fetchall()]
-
-
-async def mark_plan_followup_asked(plan_id: str) -> None:
-    async with aiosqlite.connect(config.DATABASE_PATH) as db:
-        await db.execute(
-            "UPDATE plans SET follow_up_asked_at = ? WHERE id = ?",
-            (now_iso(), plan_id),
-        )
-        await db.commit()
 
 
 # ─────────────────────────────────────────── PENDING ACTIONS (idempotency) ───────────────────────────────────────────

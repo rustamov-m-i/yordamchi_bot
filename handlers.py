@@ -1137,6 +1137,67 @@ def _failed_actions_note(ids_by_type: dict[str, list[str]]) -> str:
             f"qaytadan urinib ko'ring yoki /diagnostics.")
 
 
+def _humanize_error(exc: BaseException | None) -> str:
+    """Turn an exception into a clear, single root-cause message in O'zbek.
+
+    This is a single-user bot (the principal owns it), so surfacing the REAL
+    reason beats a generic "Texnik xato": known infra/API errors map to plain
+    language, and anything unrecognised shows a short technical detail so the
+    actual cause is visible (for reporting / fixing) instead of hidden.
+    Classifies by exception class NAME + message text, so no extra imports of
+    anthropic/httpx/aiogram exception types are needed."""
+    # Plain text only (no markdown): an error notice MUST always deliver, and the
+    # raw exception text in the unknown-error branch could contain markdown-breaking
+    # characters that would make message.answer(parse_mode="Markdown") throw.
+    if exc is None:
+        return "⚠️ Noma'lum xato yuz berdi. Qaytadan urinib ko'ring."
+    name = type(exc).__name__
+    msg = str(exc).strip()
+    low = msg.lower()
+
+    # ── Network / connectivity ──
+    if (name in ("APIConnectionError", "APITimeoutError", "ConnectError",
+                 "ConnectTimeout", "ReadTimeout", "ReadTimeoutError",
+                 "TelegramNetworkError", "ClientConnectorError")
+            or "timed out" in low or "timeout" in low
+            or "network is unreachable" in low or "connection" in low
+            or "cannot connect" in low):
+        return ("🌐 Sabab: Internet yoki server bilan ulanishda muammo "
+                "(tarmoq uzilgan/sekin). Tarmoqni tekshirib, qayta urinib ko'ring.")
+
+    # ── Anthropic: rate / auth / billing ──
+    if name == "RateLimitError" or "rate limit" in low or "429" in low:
+        return ("⏳ Sabab: Claude'ga juda ko'p so'rov yuborildi. "
+                "1-2 daqiqadan keyin qayta urining.")
+    if name == "AuthenticationError" or "api key" in low or "authentication" in low:
+        return "🔑 Sabab: Claude API kalitida muammo. Sozlamalarni tekshiring."
+    if "credit" in low or "billing" in low or "balance" in low or "insufficient" in low:
+        return "💳 Sabab: Claude hisobida mablag' tugagan ko'rinadi. To'ldirish kerak."
+
+    # ── Empty / malformed request content ──
+    if "non-empty content" in low or ("messages" in low and "content" in low):
+        return ("📭 Sabab: So'rov tarkibida bo'sh xabar bor edi. "
+                "Bu odatda tuzatiladi — qayta urinib ko'ring.")
+
+    # ── Truncated / unparseable model output ──
+    if name == "JSONDecodeError" or ("json" in low and ("delimiter" in low or "expecting" in low)):
+        return ("📄 Sabab: Claude javobi to'liq kelmadi (kesildi). "
+                "Qisqaroq so'rov bilan qayta urinib ko'ring.")
+
+    # ── Database ──
+    if (name in ("OperationalError", "IntegrityError", "ProgrammingError", "DatabaseError")
+            or "sqlite" in low or "database" in low):
+        return f"🗄 Sabab: Ma'lumotlar bazasi xatosi — {msg[:120]}"
+
+    # ── Telegram rejected the message ──
+    if name == "TelegramBadRequest":
+        return f"📨 Sabab: Telegram xabarni rad etdi — {msg[:120]}"
+
+    # ── Unknown → show the real technical cause (owner bot) ──
+    detail = f"{name}: {msg[:150]}" if msg else name
+    return f"⚠️ Kutilmagan xato.\n🔧 Sabab: {detail}\n/diagnostics — batafsil holat."
+
+
 # ─────────────────────── KEYBOARD BUILDER ───────────────────────
 
 
@@ -1214,6 +1275,11 @@ _STREAM_EDIT_MIN_DELTA_CHARS = 24    # don't spam edits for tiny additions
 
 
 _DESTRUCTIVE_ACTION_TYPES = {"create_task", "schedule_meeting"}
+
+# Most tasks/meetings creatable from a single message. A pasted list of ~14 is
+# realistic; beyond ~20 the JSON response risks truncation and the confirm card
+# grows unwieldy. We keep the first N and tell the principal to resend the rest.
+_MAX_CREATE_ACTIONS_PER_MSG = 20
 
 # Mass-delete actions ("barchasini o'chir"). These ALWAYS require confirmation —
 # independent of the confirm_create_actions setting — because they're
@@ -1321,9 +1387,47 @@ async def _format_create_preview(actions: list[dict]) -> str:
     before execution. Bulk deletes show the LIVE row count so the user sees
     exactly how much would be wiped."""
     lines = ["⚠️ **TASDIQLAYSIZMI?**", ""]
+    # When many tasks/meetings are created at once (e.g. a pasted list of 14),
+    # the full 6-line card per item overflows Telegram's 4096-char message limit
+    # and is hard to scan. Switch to one compact line per item past this count.
+    _create_types = {"create_task", "schedule_meeting"}
+    n_creates = sum(1 for a in actions if a.get("type") in _create_types)
+    compact = n_creates > 4
+    if compact:
+        lines.append(f"📋 **{n_creates} ta yangi yozuv qo'shiladi:**")
+        lines.append("")
+    create_idx = 0
     for a in actions:
         t = a.get("type")
         d = a.get("data", {}) or {}
+        if compact and t == "create_task":
+            create_idx += 1
+            title = (d.get("title") or "—").strip()
+            assignee = (d.get("assignee") or "—").strip()
+            dl_label, _ = _format_deadline_short(d.get("deadline"))
+            badge = _PRIORITY_BADGE.get(d.get("priority", "P2"), "🔵")
+            lines.append(f"{badge} {create_idx}. {title} — 👤 {assignee} · ⏳ {dl_label}")
+            continue
+        if compact and t == "schedule_meeting":
+            create_idx += 1
+            title = (d.get("title") or "—").strip()
+            start = d.get("datetime_start", "—")
+            try:
+                dt = datetime.fromisoformat(start).astimezone(database.TZ)
+                start_label = dt.strftime("%d-%m %H:%M")
+            except (ValueError, TypeError):
+                start_label = start
+            lines.append(f"🤝 {create_idx}. {title} — 🕐 {start_label}")
+            continue
+        if t == "update_task":  # import round-trip: existing task edited in Excel
+            try:
+                task = await database.get_task(a.get("id"))
+            except Exception:
+                task = None
+            title = (task or {}).get("title") or (d.get("title") or a.get("id", "—"))
+            lines.append(f"✏️ **Yangilanadi:** {title}")
+            lines.append("")
+            continue
         if t == "delete_task":
             try:
                 task = await database.get_task(a.get("id"))
@@ -1471,6 +1575,18 @@ async def _process_and_reply(message: Message, user_text: str, state: "FSMContex
             await database.complete_pending_action(pending_id)
             return
 
+        # ── Export intent ("vazifalarni eksport qil" / "excel qilib ber") ──
+        # Send the .xlsx file, same as /export — works from voice and text.
+        if any(a.get("type") == "export_tasks" for a in final_response.get("actions", [])):
+            await database.complete_pending_action(pending_id)
+            if progress_msg is not None:
+                try:
+                    await progress_msg.delete()
+                except TelegramBadRequest:
+                    pass
+            await _send_tasks_export(message)
+            return
+
         # ── "Ko'rsat/ro'yxat" intent — render the REAL section from the DB ──
         # Claude's state block only holds today+overdue, so letting it enumerate
         # "all tasks" yields an incomplete list. Intercept show_* and render the
@@ -1494,6 +1610,26 @@ async def _process_and_reply(message: Message, user_text: str, state: "FSMContex
         # create_task / schedule_meeting confirm only if the setting is on
         # (default ON; /settings dan o'chirish mumkin).
         actions = final_response.get("actions", [])
+        # Cap mass-create requests so a huge pasted list can't truncate the JSON
+        # or overflow the confirm card. Keep the first N create actions in order,
+        # drop the rest, and tell the principal to resend them.
+        _overflow_note = ""
+        _n_creates = sum(1 for a in actions if a.get("type") in _DESTRUCTIVE_ACTION_TYPES)
+        if _n_creates > _MAX_CREATE_ACTIONS_PER_MSG:
+            dropped = _n_creates - _MAX_CREATE_ACTIONS_PER_MSG
+            kept, seen = [], 0
+            for a in actions:
+                if a.get("type") in _DESTRUCTIVE_ACTION_TYPES:
+                    seen += 1
+                    if seen > _MAX_CREATE_ACTIONS_PER_MSG:
+                        continue
+                kept.append(a)
+            actions = kept
+            final_response["actions"] = actions
+            _overflow_note = (
+                f"\n\n⚠️ Bir xabarda {_MAX_CREATE_ACTIONS_PER_MSG} tagacha yozuv qo'shiladi. "
+                f"Qolgan {dropped} tasini alohida xabarda yuboring."
+            )
         try:
             _settings = await database.get_settings()
         except Exception:
@@ -1507,7 +1643,7 @@ async def _process_and_reply(message: Message, user_text: str, state: "FSMContex
             to_confirm += [a for a in actions if a.get("type") in _DESTRUCTIVE_ACTION_TYPES]
         if state is not None and to_confirm:
             if True:
-                preview = await _format_create_preview(to_confirm)
+                preview = await _format_create_preview(to_confirm) + _overflow_note
                 confirm_kb = InlineKeyboardMarkup(inline_keyboard=[[
                     InlineKeyboardButton(text="✅ Tasdiqlayman", callback_data="acts_confirm"),
                     InlineKeyboardButton(text="✕ Bekor qilish", callback_data="acts_cancel"),
@@ -1544,6 +1680,7 @@ async def _process_and_reply(message: Message, user_text: str, state: "FSMContex
 
         text = (final_response.get("user_message") or "").strip() or "✅"
         text += _failed_actions_note(ids_by_type)
+        text += _overflow_note
         if progress_msg is not None:
             # Finalize the same message we've been editing — single chat bubble.
             try:
@@ -1563,7 +1700,7 @@ async def _process_and_reply(message: Message, user_text: str, state: "FSMContex
         # Tell the user instead of failing silently. Handled here (no re-raise);
         # the global error handler in bot.py is the fallback for everything else.
         try:
-            await message.answer("⚠️ Texnik xato yuz berdi. Iltimos, qaytadan urinib ko'ring.")
+            await message.answer(_humanize_error(e))
         except Exception:
             logger.debug("Could not send error notice in _process_and_reply")
     finally:
@@ -1673,13 +1810,14 @@ async def cmd_delegations(message: Message) -> None:
     async with aiosqlite.connect(config.DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            """SELECT id, title, assignee, deadline, status, created_at,
-                      julianday('now') - julianday(created_at) AS age_days
+            """SELECT *, julianday('now') - julianday(created_at) AS age_days
                FROM tasks
                WHERE status IN ('todo', 'in_progress')
                  AND assignee IS NOT NULL
-                 AND TRIM(assignee) != ''
-                 AND LOWER(assignee) NOT IN ('belgilanmagan', 'men', 'siz', 'o''zim', 'ozim', 'o''z', 'oz')
+                 AND LOWER(TRIM(assignee)) NOT IN (
+                     '', 'men', 'siz', 'belgilanmagan', '—',
+                     'oʻzim', 'o''zim', 'o''z', 'ozim'
+                 )
                ORDER BY age_days DESC
                LIMIT 20"""
         )
@@ -1688,30 +1826,467 @@ async def cmd_delegations(message: Message) -> None:
     if not rows:
         await _safe_answer(
             message,
-            "👥 **DELEGATSIYALAR**\n\n_Boshqa kishilarga berilgan aktiv vazifa yo'q._",
+            "👥  **DELEGATSIYALAR**\n\n_Boshqa kishilarga berilgan aktiv vazifa yo'q._",
             parse_mode="Markdown",
             reply_markup=single_back_keyboard(),
         )
         return
 
-    lines = ["👥 **DELEGATSIYALAR**", "", f"_{len(rows)} ta aktiv delegatsiya:_", ""]
-    for i, t in enumerate(rows[:12], 1):
-        age = int(t["age_days"] or 0)
-        age_label = "bugun" if age == 0 else f"{age} kun"
-        deadline_label, _ = _format_deadline_short(t.get("deadline"))
-        title = (t.get("title") or "—")[:60]
-        lines.append(f"**{i}. {title}**")
-        lines.append(f"   👤 {t['assignee']} · ⏳ {deadline_label} · 📅 {age_label} oldin")
+    # Same card concept as the Tasks section (badge + title, blank, aligned
+    # labeled lines, dividers). Badge reflects how long it's been pending — a
+    # stuck delegation is the thing this view exists to surface.
+    DIVIDER = "━" * 20
+    shown = rows[:12]
+    lines = ["👥  **DELEGATSIYALAR**", "", f"Natija · {len(rows)} ta", "", DIVIDER, ""]
+    for i, t in enumerate(shown, 1):
+        age = int(t.get("age_days") or 0)
+        badge = "🔴" if age >= 7 else "🟠" if age >= 3 else "🟡" if age >= 1 else "⚪"
+        assignee = ((t.get("assignee") or "—").strip() or "—")
+        assignee = assignee[0].upper() + assignee[1:]
+        deadline = _task_deadline_chip(t)
+        age_label = "bugun berilgan" if age == 0 else f"{age} kun oldin"
+        lines.append(f"{i}.  {badge}  {(t.get('title') or '—').strip()}")
         lines.append("")
+        lines.append(f"      👤  Ijrochi:     {assignee}")
+        lines.append(f"      ⏳  Muddat:      {deadline}")
+        lines.append(f"      ⏱  Kutilmoqda:  {age_label}")
+        if i < len(shown):
+            lines.append("")
     if len(rows) > 12:
-        lines.append(f"_+{len(rows) - 12} ta yana_")
+        lines.extend(["", f"_+{len(rows) - 12} ta yana_"])
+    lines.extend(["", DIVIDER, "", "_Raqamni bosing — vazifa kartasi._"])
 
+    # Drill-down: tap a number → open that task's card (taskopen:{id}), + back.
+    nums = [InlineKeyboardButton(text=str(i), callback_data=f"taskopen:{t['id']}")
+            for i, t in enumerate(shown, 1)]
+    kb_rows = [nums[j:j + 5] for j in range(0, len(nums), 5)]
+    kb_rows.append([back_button()])
     await _safe_answer(
         message,
         "\n".join(lines),
         parse_mode="Markdown",
-        reply_markup=single_back_keyboard(),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
     )
+
+
+# ─────────────────────── EXPORT / IMPORT (Excel) ───────────────────────
+
+# Shared column schema for export & import. "№" is a row-number column (ignored
+# on import — matched by name). Headers are lowercased when read back.
+_EXPORT_HEADERS = ["№", "Vazifa", "Ijrochi", "Muddat", "Ustuvorlik", "Holat", "Izoh"]
+
+
+def _export_date(iso):
+    """ISO deadline → a real date object (no time — the principal asked to drop
+    the clock) for the Excel cell, or None. Written with a DD-MM-YYYY number
+    format so Excel shows/sorts it as a date; _import_deadline reads it back."""
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso).astimezone(database.TZ).date()
+    except (ValueError, TypeError):
+        return None
+
+
+def _import_deadline(val):
+    """Excel/CSV cell → ISO deadline or None. Accepts datetime cells, ISO strings,
+    and DD-MM-YYYY[ HH:MM] / DD.MM.YYYY forms; unparseable → None (no deadline).
+    Naive datetimes are localized via TZ.localize (pytz) — NOT .replace(tzinfo=),
+    which would yield the +04:37 LMT offset instead of +05:00."""
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return (val if val.tzinfo else database.TZ.localize(val)).isoformat()
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+        return (dt if dt.tzinfo else database.TZ.localize(dt)).isoformat()
+    except ValueError:
+        pass
+    for fmt in ("%d-%m-%Y %H:%M", "%d-%m-%Y", "%d.%m.%Y %H:%M", "%d.%m.%Y"):
+        try:
+            return database.TZ.localize(datetime.strptime(s, fmt)).isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _import_priority(val) -> str:
+    """Cell → P0-P3. Accepts codes (P0..P3) and Uzbek labels (Shoshilinch..)."""
+    s = str(val or "").strip().lower()
+    if s in ("p0", "p1", "p2", "p3"):
+        return s.upper()
+    return {v.lower(): k for k, v in _PRIORITY_LABEL_UZ.items()}.get(s, "P2")
+
+
+def _import_status(val) -> str:
+    """Cell → status code; defaults to 'todo'."""
+    s = str(val or "").strip().lower()
+    if s in ("todo", "in_progress", "blocked", "done"):
+        return s
+    return {v.lower(): k for k, v in _STATUS_LABEL_UZ.items()}.get(s, "todo")
+
+
+@router.message(Command("export"))
+async def cmd_export(message: Message) -> None:
+    """Export tasks to an .xlsx. Also reachable by voice/text ('eksport qil')."""
+    await _send_tasks_export(message)
+
+
+async def _send_tasks_export(message: Message) -> None:
+    """Build and send the tasks workbook (Template style). Shared by /export and
+    the export_tasks action (voice/text 'vazifalarni eksport qil')."""
+    import io
+    from aiogram.types import BufferedInputFile
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        await message.answer("⚠️ Excel kutubxonasi (openpyxl) o'rnatilmagan.")
+        return
+
+    tasks = await database.list_tasks(limit=10000)  # all statuses
+    if not tasks:
+        await message.answer("📭 Eksport qilish uchun vazifa yo'q.")
+        return
+
+    # ── Template style: clean document look — bold black title/header, hair-line
+    #    borders, no fills (only the subtitle is shaded), a № column, real dates. ──
+    ARIAL = "Arial"
+    SUB = "F2F2F2"
+    hair = Side(style="hair")
+    grid = Border(left=hair, right=hair, top=hair, bottom=hair)
+    last_col = get_column_letter(len(_EXPORT_HEADERS))  # 7 cols (№ + 6) → "G"
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Vazifalar"
+
+    # Row 1 — title (merged B1:G1, centered, bold, no fill — № column stays clear)
+    ws.merge_cells(f"B1:{last_col}1")
+    t1 = ws["B1"]
+    t1.value = "VAZIFALAR RO'YXATI"
+    t1.font = Font(name=ARIAL, size=18, bold=True, color="000000")
+    t1.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 30
+
+    # Row 2 — subtitle (merged B2:G2, light gray, left)
+    ws.merge_cells(f"B2:{last_col}2")
+    t2 = ws["B2"]
+    now_s = datetime.now(database.TZ).strftime("%d-%m-%Y %H:%M")
+    t2.value = f"Yaratilgan: {now_s}      Jami: {len(tasks)} ta vazifa"
+    t2.font = Font(name=ARIAL, size=11, color="404040")
+    t2.fill = PatternFill("solid", fgColor=SUB)
+    t2.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    ws.row_dimensions[2].height = 20
+
+    # Row 3 — header (Arial 14 bold, centered, hair borders, no fill)
+    for i, h in enumerate(_EXPORT_HEADERS, 1):
+        c = ws.cell(row=3, column=i, value=h)
+        c.font = Font(name=ARIAL, size=14, bold=True, color="000000")
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = grid
+    ws.row_dimensions[3].height = 38
+
+    # Rows 4+ — data (Arial 13; № + 6 fields; Muddat a real date, no time)
+    for n, t in enumerate(tasks, start=1):
+        r = n + 3
+        cells = [
+            n,
+            (t.get("title") or "").strip(),
+            (t.get("assignee") or "").strip(),
+            _export_date(t.get("deadline")),
+            _PRIORITY_LABEL_UZ.get(t.get("priority", "P2"), "Rejadagi"),
+            _STATUS_LABEL_UZ.get(t.get("status", "todo"), t.get("status", "")),
+            (t.get("description") or "").strip(),
+        ]
+        for i, val in enumerate(cells, 1):
+            c = ws.cell(row=r, column=i, value=val)
+            c.font = Font(name=ARIAL, size=13, color="000000")
+            c.border = grid
+            left = (i == 2)  # only Vazifa is left-aligned; the rest centered
+            c.alignment = Alignment(
+                horizontal="left" if left else "center",
+                vertical="center", wrap_text=(i in (2, 7)), indent=1 if left else 0,
+            )
+            if i == 4 and val is not None:
+                c.number_format = "DD-MM-YYYY"  # date only — no clock
+        # Hidden ID (col H) — lets a re-imported export UPDATE the task instead
+        # of creating a duplicate. Invisible in Excel; matched by name on import.
+        idc = ws.cell(row=r, column=8, value=t.get("id"))
+        idc.font = Font(name=ARIAL, size=11, color="808080")
+        idc.border = grid
+        ws.row_dimensions[r].height = 45
+
+    ws.cell(row=3, column=8, value="ID").font = Font(name=ARIAL, size=11, bold=True, color="808080")
+    for col, w in zip("ABCDEFG", [8.8, 61.8, 33.2, 31.5, 28.5, 23.3, 58.0]):
+        ws.column_dimensions[col].width = w
+    ws.column_dimensions["H"].hidden = True  # ID column — present for round-trip, hidden
+    ws.freeze_panes = "A4"  # title + subtitle + header stay visible while scrolling
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    fname = f"vazifalar_{datetime.now(database.TZ).strftime('%Y-%m-%d')}.xlsx"
+    await message.answer_document(
+        BufferedInputFile(buf.getvalue(), filename=fname),
+        caption=(f"📤 **{len(tasks)} ta vazifa** eksport qilindi.\n\n"
+                 "_Faylni tahrirlab yoki qator qo'shib qaytadan yuborsangiz — "
+                 "import bo'ladi (tasdiqdan keyin)._"),
+        parse_mode="Markdown",
+    )
+
+
+def _norm_header(c) -> str:
+    """Normalize a header cell for matching: lowercase, drop apostrophe variants and
+    spaces — so 'Mas'ul', 'Mas'ul xodim', 'Tugatish sanasi' map cleanly."""
+    s = str(c or "").strip().lower()
+    for ch in ("'", "ʼ", "’", "`", "ʻ", " "):
+        s = s.replace(ch, "")
+    return s
+
+
+# Column synonyms (normalized) — keep the importer forgiving about header names.
+_COL_TITLE = ("vazifa", "topshiriq", "nomi", "ish", "title", "task")
+_COL_ASSIGNEE = ("ijrochi", "masul", "masulxodim", "bajaruvchi", "kim", "kimbajaradi", "assignee")
+_COL_DEADLINE = ("muddat", "muddati", "sana", "tugatishsanasi", "tugashsanasi", "deadline")
+_COL_PRIORITY = ("ustuvorlik", "muhimlik", "daraja", "darajasi", "priority")
+_COL_STATUS = ("holat", "holati", "status")
+_COL_DESC = ("izoh", "izohi", "tavsif", "tavsifi", "qoshimcha", "description")
+
+
+def _structured_tasks_from_table(table: list) -> list[dict]:
+    """Fast path: if the table has a recognizable header row, map columns by name
+    → create_task actions. Header names are normalized and common synonyms accepted
+    (Mas'ul→ijrochi, Topshiriq→vazifa, …). Returns [] when no header is found."""
+    header_idx = next(
+        (i for i, row in enumerate(table) if any(_norm_header(c) in _COL_TITLE for c in row)),
+        None,
+    )
+    if header_idx is None:
+        return []
+    header = [_norm_header(c) for c in table[header_idx]]
+
+    def pick(d, names):
+        for n in names:
+            v = d.get(n)
+            if v not in (None, ""):
+                return v
+        return None
+
+    out: list[dict] = []
+    for r in table[header_idx + 1:]:
+        d = {header[i]: r[i] for i in range(min(len(header), len(r)))}
+        title = str(pick(d, _COL_TITLE) or "").strip()
+        if not title:
+            continue
+        data = {
+            "title": title,
+            "priority": _import_priority(pick(d, _COL_PRIORITY)),
+            "status": _import_status(pick(d, _COL_STATUS)),
+            "deadline": _import_deadline(pick(d, _COL_DEADLINE)),
+        }
+        asg = str(pick(d, _COL_ASSIGNEE) or "").strip()
+        if asg:
+            data["assignee"] = asg
+        desc = str(pick(d, _COL_DESC) or "").strip()
+        # Never let the assignee leak into the description (reported field-mix bug).
+        if desc and not (asg and desc.strip().lower() == asg.strip().lower()):
+            data["description"] = desc
+        # Carry the optional ID (hidden export column) so the caller can turn this
+        # into an UPDATE when the task still exists — instead of a duplicate.
+        out.append({"type": "create_task", "data": data, "_id": str(pick(d, ("id",)) or "").strip()})
+    return out
+
+
+def _apply_title_dedup(actions: list, by_title: dict) -> int:
+    """Convert each create_task whose (normalized) title matches an existing ACTIVE
+    task into an update_task — so importing identical tasks never duplicates them.
+    Mutates `actions` in place; returns how many were converted to updates."""
+    n = 0
+    for a in actions:
+        if a.get("type") != "create_task":
+            continue
+        key = ((a.get("data") or {}).get("title") or "").strip().lower()
+        if key and key in by_title:
+            a["type"] = "update_task"
+            a["id"] = by_title[key]
+            n += 1
+    return n
+
+
+def _table_to_text(table: list, max_rows: int = 120, max_chars: int = 6000) -> str:
+    """Render a parsed table as plain text for the smart extractor."""
+    lines = []
+    for row in table[:max_rows]:
+        cells = [("" if c is None else str(c)).strip() for c in row]
+        if any(cells):
+            lines.append(" | ".join(cells))
+    return "\n".join(lines)[:max_chars]
+
+
+async def _smart_tasks_from_table(table: list) -> list[dict]:
+    """Flexible import (no fixed format): hand the raw file content to Claude and
+    let it find the tasks — whatever the column names, order, or layout. Returns
+    create_task actions (deadline as ISO); [] if nothing task-like is found."""
+    content = _table_to_text(table)
+    if not content.strip():
+        return []
+    directive = (
+        "[INTERNAL] extract_tasks_from_file\n\n"
+        "Quyidagi fayl mazmunidan printsipalning VAZIFALARINI ajrat. Fayl istalgan "
+        "ko'rinishda bo'lishi mumkin — ustun nomlari boshqacha, tartibsiz yoki erkin matn. "
+        "Har bir ANIQ vazifa uchun create_task action chiqar. Maydonlarni ARALASHTIRMA:\n"
+        "- title: faqat ish nomi (imperativ). Ichida ijrochi/sana BO'LMASIN.\n"
+        "- assignee: ijrochi/mas'ul ismi — bo'lsa; yo'q bo'lsa qo'yma.\n"
+        "- deadline: ISO 8601 Asia/Tashkent yoki null.\n"
+        "- priority: P0/P1/P2/P3 — matndan tushun, aniqmasa P2.\n"
+        "- description: FAQAT manbada mavjud qo'shimcha tushuntirish. Ichiga ijrochi "
+        "ismini, sanani yoki ustuvorlikni YOZMA — ular alohida maydonlarda. "
+        "Qo'shimcha izoh bo'lmasa — description'ni umuman QO'YMA (bo'sh/null). "
+        "HECH NARSA O'YLAB TOPMA (masalan 'Fayldan import qilingan' kabi matn yozma).\n"
+        "Sarlavha, 'jami', izoh kabi vazifa BO'LMAGAN qatorlarni tashlab ket. "
+        "Hech narsa topilmasa — actions=[].\n\n"
+        f"FAYL MAZMUNI:\n{content}"
+    )
+    try:
+        resp = await claude_service.process_message("", internal_directive=directive)
+    except Exception:
+        logger.exception("smart import extraction failed")
+        return []
+    _GENERIC_DESC = {
+        "fayldan import qilingan vazifa", "import qilingan vazifa", "fayldan import qilingan",
+        "import qilingan", "fayldan", "vazifa", "—", "-",
+    }
+    out: list[dict] = []
+    for a in resp.get("actions", []):
+        if a.get("type") != "create_task":
+            continue
+        d = a.get("data") or {}
+        if not (d.get("title") or "").strip():
+            continue
+        # Safety net: strip a description that's just the assignee or an invented filler.
+        desc = (d.get("description") or "").strip()
+        asg = (d.get("assignee") or "").strip()
+        if desc and (desc.lower() in _GENERIC_DESC
+                     or (asg and desc.lower() == asg.lower())):
+            d.pop("description", None)
+        out.append(a)
+    return out
+
+
+def _is_task_import_doc(message: Message) -> bool:
+    """True for .xlsx/.csv/.pdf documents — routes them to the importer. Registered
+    BEFORE the generic 'unsupported attachment' handler so it wins for these."""
+    doc = message.document
+    return bool(doc and (doc.file_name or "").lower().endswith((".xlsx", ".csv", ".pdf")))
+
+
+@router.message(_is_task_import_doc)
+async def handle_task_import(message: Message, state: FSMContext) -> None:
+    """Parse an uploaded .xlsx/.csv of tasks → preview → confirm → create.
+    Reuses the standard acts_confirm pipeline so nothing is created silently."""
+    import io
+    doc = message.document
+    name = (doc.file_name or "").lower()
+    try:
+        file = await message.bot.get_file(doc.file_id)
+        blob = await message.bot.download_file(file.file_path)
+        data = blob.read() if hasattr(blob, "read") else blob
+    except Exception as e:
+        await message.answer(_humanize_error(e))
+        return
+
+    # ── Read the file into a raw table (list of row tuples) ──
+    try:
+        if name.endswith(".csv"):
+            import csv
+            table = [tuple(r) for r in csv.reader(io.StringIO(data.decode("utf-8-sig", errors="replace")))
+                     if any((c or "").strip() for c in r)]
+        elif name.endswith(".pdf"):
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(data))
+            text = "\n".join((p.extract_text() or "") for p in reader.pages)
+            # PDFs have no columns → each text line becomes a row; the smart
+            # extractor (Claude) finds the tasks in whatever the layout is.
+            table = [(ln.strip(),) for ln in text.splitlines() if ln.strip()]
+        else:
+            from openpyxl import load_workbook
+            ws = load_workbook(io.BytesIO(data), read_only=True, data_only=True).active
+            table = [r for r in ws.iter_rows(values_only=True)
+                     if any(c is not None and str(c).strip() for c in r)]
+    except Exception as e:
+        await message.answer("📄 Faylni o'qib bo'lmadi.\n"
+                             f"🔧 {type(e).__name__}: {str(e)[:100]}")
+        return
+    if not table:
+        await message.answer("📄 Fayl bo'sh — vazifa topilmadi.")
+        return
+
+    # ── No fixed format required. Stage 1: recognizable columns (fast, free).
+    #    Stage 2: if none, Claude reads the raw content and finds tasks in ANY
+    #    layout (different headers, free text, mixed). ──
+    actions = _structured_tasks_from_table(table)
+    method = "ustunlar bo'yicha"
+    # Round-trip dedup: a row whose ID (hidden export column) still exists becomes
+    # an UPDATE — so editing the exported file and re-sending it changes the task
+    # instead of creating a duplicate. Unknown/blank ID → a new task.
+    for a in actions:
+        rid = a.pop("_id", "")
+        if rid and await database.get_task(rid):
+            a["type"] = "update_task"
+            a["id"] = rid
+    if not actions:
+        thinking = await message.answer("🔍 Fayldan vazifalarni topyapman…")
+        actions = await _smart_tasks_from_table(table)
+        method = "aqlli tahlil"
+        try:
+            await thinking.delete()
+        except TelegramBadRequest:
+            pass
+
+    if not actions:
+        await message.answer(
+            "📄 Faylda vazifaga o'xshash ma'lumot topilmadi. Sarlavha, ijrochi yoki "
+            "muddat bo'lgan qator/ustunlar bo'lsa — qayta yuboring."
+        )
+        return
+
+    # ── Content dedup: a task whose title matches an existing ACTIVE one becomes
+    #    an UPDATE — identical tasks are NEVER duplicated. Covers files without the
+    #    hidden ID column AND the smart-extracted path (ID dedup ran above). ──
+    _existing = await database.list_tasks(status_in=["todo", "in_progress", "blocked"], limit=2000)
+    _by_title: dict = {}
+    for _t in _existing:
+        _k = (_t.get("title") or "").strip().lower()
+        if _k:
+            _by_title.setdefault(_k, _t["id"])
+    _apply_title_dedup(actions, _by_title)
+
+    # ── Cap + preview + confirm (reuse the standard acts_confirm pipeline) ──
+    overflow = ""
+    if len(actions) > _MAX_CREATE_ACTIONS_PER_MSG:
+        dropped = len(actions) - _MAX_CREATE_ACTIONS_PER_MSG
+        actions = actions[:_MAX_CREATE_ACTIONS_PER_MSG]
+        overflow = (f"\n\n⚠️ Bir importda {_MAX_CREATE_ACTIONS_PER_MSG} tagacha. "
+                    f"Qolgan {dropped} tasini alohida fayl bilan yuboring.")
+
+    preview = f"📥 **IMPORT** ({method}) — {len(actions)} ta vazifa\n\n" + await _format_create_preview(actions) + overflow
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Import qilaman", callback_data="acts_confirm"),
+        InlineKeyboardButton(text="✕ Bekor", callback_data="acts_cancel"),
+    ]])
+    n_upd = sum(1 for a in actions if a.get("type") == "update_task")
+    n_new = len(actions) - n_upd
+    done_msg = "📥 Import: " + f"{n_new} yangi" + (f", {n_upd} yangilangan" if n_upd else "") + " vazifa."
+    await state.set_state(CreateActionConfirmFSM.awaiting)
+    await state.update_data(
+        pending_response={"actions": actions, "user_message": done_msg, "buttons": []},
+        _prior_section=None,
+    )
+    await _safe_answer(message, preview, parse_mode="Markdown", reply_markup=confirm_kb)
 
 
 @router.message(Command("diagnostics"))
@@ -1720,7 +2295,8 @@ async def cmd_diagnostics(message: Message) -> None:
     Useful when something feels broken and you want a single view of internals."""
     import os
     import claude_service
-    lines = ["🔍 **DIAGNOSTICS**", ""]
+    DIVIDER = "━" * 20
+    lines = ["🔍  **DIAGNOSTICS**", "", DIVIDER, ""]
 
     # DB size
     try:
@@ -1782,7 +2358,9 @@ async def cmd_diagnostics(message: Message) -> None:
     bg = len(_background_tasks)
     lines.append(f"🔧 Background tasks: {bg}")
 
-    await _safe_answer(message, "\n".join(lines), parse_mode="Markdown")
+    lines.extend(["", DIVIDER])
+    await _safe_answer(message, "\n".join(lines), parse_mode="Markdown",
+                       reply_markup=single_back_keyboard())
 
 
 @router.message(Command("help"))
@@ -2046,6 +2624,36 @@ async def cmd_briefing(message: Message, state: FSMContext | None = None) -> Non
 
 
 _PRIORITY_BADGE = {"P0": "🔴", "P1": "🟠", "P2": "🔵", "P3": "⚪"}
+
+
+def _task_badge(task: dict) -> str:
+    """Single source of truth for a task's leading status dot — used by the list,
+    the drill-down card, AND the detail card so the SAME task never shows two
+    different dots. Urgency-aware: done > blocked > overdue/P0 > P1 > today > routine."""
+    if task.get("status") == "done":
+        return "✅"
+    if task.get("status") == "blocked":
+        return "🚧"  # stuck — needs unblocking
+    priority = task.get("priority", "P2")
+    deadline = task.get("deadline")
+    is_overdue = is_today = False
+    if deadline:
+        try:
+            dt = datetime.fromisoformat(deadline).astimezone(database.TZ)
+            now = datetime.now(database.TZ)
+            is_overdue = dt < now
+            is_today = (not is_overdue) and dt.date() == now.date()
+        except (ValueError, TypeError):
+            pass
+    if is_overdue or priority == "P0":
+        return "🔴"
+    if priority == "P1":
+        return "🟠"
+    if is_today:
+        return "🟡"
+    return "⚪"
+
+
 # User-facing priority names — replace technical P0/P1/P2/P3 in ALL displays.
 _PRIORITY_LABEL_UZ = {
     "P0": "Shoshilinch",
@@ -2530,7 +3138,7 @@ async def cb_new_type(query: CallbackQuery, state: FSMContext) -> None:
 
 def _format_task_card(t: dict, idx: int = None, show_status: bool = True) -> str:
     """Compact task card for the main task drill-down screen."""
-    badge = _PRIORITY_BADGE.get(t.get("priority", "P2"), "🔵")
+    badge = _task_badge(t)  # unified with the list — same dot for the same task
     priority_name = _PRIORITY_LABEL_UZ.get(t.get("priority", "P2"), "Rejadagi")
     status = t.get("status", "todo")
     status_uz = _STATUS_LABEL_UZ.get(status, status)
@@ -2554,7 +3162,7 @@ def _format_task_card(t: dict, idx: int = None, show_status: bool = True) -> str
 
 def _format_task_detail_card(t: dict, idx: int = None) -> str:
     """Full task card for ⋯ Batafsil."""
-    badge = _PRIORITY_BADGE.get(t.get("priority", "P2"), "🔵")
+    badge = _task_badge(t)  # unified with the list — same dot for the same task
     priority_name = _PRIORITY_LABEL_UZ.get(t.get("priority", "P2"), "Rejadagi")
     status = t.get("status", "todo")
     status_uz = _STATUS_LABEL_UZ.get(status, status)
@@ -2699,53 +3307,35 @@ def _format_tasks_compact(
     unfinished = [t for t in page_tasks if t.get("status") != "done"]
     done = [t for t in page_tasks if t.get("status") == "done"]
 
-    def _task_badge(task: dict) -> str:
-        """Per-task badge — done > blocked > overdue/urgent > important > today > routine."""
-        if task.get("status") == "done":
-            return "✅"
-        if task.get("status") == "blocked":
-            return "🚧"  # stuck — needs unblocking
-        priority = task.get("priority", "P2")
-        deadline = task.get("deadline")
-        is_overdue = False
-        is_today = False
-        if deadline:
-            try:
-                dt = datetime.fromisoformat(deadline).astimezone(database.TZ)
-                now = datetime.now(database.TZ)
-                is_overdue = dt < now
-                is_today = (not is_overdue) and dt.date() == now.date()
-            except (ValueError, TypeError):
-                pass
-        if is_overdue or priority == "P0":
-            return "🔴"
-        if priority == "P1":
-            return "🟠"
-        if is_today:
-            return "🟡"
-        return "⚪"
-
     def _muhimlik_icon(priority: str) -> str:
         return {"P0": "⚡", "P1": "⭐", "P2": "🔹", "P3": "🔹"}.get(priority, "🔹")
 
     def _task_card_lines(task: dict, num: int) -> list[str]:
-        """Render one unfinished task as a 5-line card (title, blank, 3 details)."""
+        """Render one unfinished task as a labeled card: badge+title, blank, then
+        aligned 👤 Ijrochi / ⏳ Muddat / Muhimlik lines, plus 📝 Izoh when present.
+        The leading badge signals urgency at a glance (🔴/🟠/🟡/⚪/🚧)."""
         title = (task.get("title") or "—").strip()
         badge = _task_badge(task)
         assignee = ((task.get("assignee") or "Belgilanmagan").strip() or "Belgilanmagan")
         assignee = assignee[0].upper() + assignee[1:]
-        deadline = _task_deadline_chip(task)
+        deadline = _task_deadline_chip(task)  # smart: "Bugun 17:00" / "08-06 17:00"
         muhimlik_name = _PRIORITY_LABEL_UZ.get(task.get("priority", "P2"), "Rejadagi")
         muhimlik_emoji = _muhimlik_icon(task.get("priority", "P2"))
-        # Pad labels to a stable visual column. Labels: Ijrochi:(8) Muddat:(7) Muhimlik:(9)
-        # → pad all to width 9 + 4 spaces of breathing room before the value.
-        return [
+        # Pad labels to a stable value column. Labels: Ijrochi:(8) Muddat:(7)
+        # Muhimlik:(9) Izoh:(5) → value starts 13 chars after the label text.
+        card = [
             f"{num}.  {badge}  {title}",
-            "",
+            "",  # blank after title — lets the title stand out as the card header
             f"      👤  Ijrochi:     {assignee}",
             f"      ⏳  Muddat:      {deadline}",
             f"      {muhimlik_emoji}  Muhimlik:    {muhimlik_name}",
         ]
+        # Full izoh (description) — aligned label; newlines collapsed so it stays
+        # one logical block; Telegram wraps long text on its own.
+        description = " ".join((task.get("description") or "").split())
+        if description:
+            card.append(f"      📝  Izoh:        {description}")
+        return card
 
     abs_idx = start
 
@@ -2784,9 +3374,10 @@ def _format_tasks_compact(
             assignee = ((t.get("assignee") or "Belgilanmagan").strip() or "Belgilanmagan")
             assignee = assignee[0].upper() + assignee[1:]
             done_cards.append([
-                f"{abs_idx}.   {title}",
-                f"        📅  Yopildi:    {date_str}",
-                f"        👤  Ijrochi:    {assignee}",
+                f"{abs_idx}.  ✅  {title}",
+                "",
+                f"      📅  Yopildi:    {date_str}",
+                f"      👤  Ijrochi:    {assignee}",
             ])
         for i, card in enumerate(done_cards):
             if i:
@@ -4836,26 +5427,10 @@ async def handle_plan_situation_text(message: Message, state: FSMContext) -> Non
         return
 
     await state.clear()
-    await _run_planning_session(message, message.text)
-
-
-@router.message(StateFilter(PlanFSM.awaiting_situation), F.voice)
-async def handle_plan_situation_voice(message: Message, state: FSMContext, bot: Bot) -> None:
-    await state.clear()
-    # Reuse voice handler logic
-    if message.voice.file_size and message.voice.file_size > voice_service.MAX_AUDIO_BYTES:
-        await message.answer("Ovoz juda katta. Iltimos, qisqaroq yuboring.")
-        return
-    await message.bot.send_chat_action(message.chat.id, "typing")
-    file = await bot.get_file(message.voice.file_id)
-    audio_io = await bot.download_file(file.file_path)
-    audio_bytes = audio_io.getvalue() if hasattr(audio_io, "getvalue") else audio_io.read()
-    transcript = await voice_service.transcribe(audio_bytes, filename="voice.ogg", language="uz")
-    if not transcript:
-        await message.answer("Ovozni o'qiy olmadim. Matn bilan qayta yuboring.")
-        return
-    await message.answer(f"_🎙 Tushundim:_ {_escape_markdown(transcript[:200])}…", parse_mode="Markdown")
-    await _run_planning_session(message, transcript)
+    # _get_text_or_transcribe patched message.text with the transcript for voice,
+    # so _msg_text is the situation for BOTH text and voice. The F.text | F.voice
+    # filter above already catches both — no separate F.voice handler is needed.
+    await _run_planning_session(message, _msg_text)
 
 
 @router.callback_query(F.data == "plan_cancel")
@@ -4887,48 +5462,99 @@ async def cb_plan_auto(query: CallbackQuery, state: FSMContext) -> None:
 
 _PLAN_DIRECTIVE = """[INTERNAL] executive_plan
 
-Act as the principal's senior Chief of Staff / strategy advisor — NOT a to-do
-organizer. Lead with strategy: start with a STRATEGIK FOKUS block (Maqsad / Eng
-muhim bitta narsa / Leverage), then the structured plan (45_planning.md). Apply
-leverage (80-20), critical-path sequencing, explicit trade-offs, second-order
-risks, aggressive delegation, and say what to DROP today (XAVF & TRADE-OFF section).
+Act as the principal's Chief of Staff for a DELEGATOR. Produce a "TEZKOR NAZORAT"
+control board in O'zbek using the EXACT template in 45_planning.md — detailed task
+CARDS, color-coded load, firm decisions. A control panel, not prose.
 
-Produce a FULL executive planning document in O'zbek (lotin), structured per 45_planning.md (clean emoji sections, no tables).
+SECTIONS, in this exact order (skip one ONLY if its data is empty):
+1) 📌 SARLAVHA — "**<DD-MM> TO'LQINI — TEZKOR NAZORAT**", then "Maqsad: <1 jumla>" and
+   "Fokus: **N ta shoshilinch vazifa + N ta qayta taqsimot + N ta mas'ul tayinlash**" (EXACT counts).
+2) ⏳ P0 — BUGUN DARHOL — 1-3 must-act-now CARDS (assign a missing owner / pull work off
+   the overloaded person / the riskiest item). Omit the section if nothing is urgent today.
+3) ⏳ <DD-MM> DEADLINE — <N> TA VAZIFA — every task due that day as a CARD, critical-path order.
+   If deadlines do NOT cluster on one day, title it "📋 USTUVOR VAZIFALAR" and order by nearest deadline.
+4) 📌 YUK BALANSI — per-owner load, COLOR-CODED: 🔴 overloaded (bottleneck) / 🟡 moderate /
+   🟢 free. EXACT counts from the LOAD BY ASSIGNEE block. If NO delegation (all "—"), use 🔑 FAQAT SIZ.
+5) ⏳ BUGUNGI HARAKAT REJASI — concrete time blocks ("HH:MM — <harakat>"); compute meeting+deadline conflicts.
+6) 📌 QARORLAR — 🔷 firm decisions, including what to defer/drop (the trade-off).
+7) 📌 BOSH FORMULA — "Bugun: **...**" / "Ertaga: **...**" / "<DD-MM>: **...**".
+
+CARD format (one blank line between cards):
+**<N>. <icon> <sarlavha>**
+👤 Ijrochi: <ism / **tayinlanmagan** / qayta taqsimlash kerak>
+⏳ Muddat: <DD-MM HH:MM>
+⭐ Muhimlik: Yuqori   (yoki "🔷 Muhimlik: Rejadagi/Muhim")
+📝 Izoh: <next action; optional "Ichki deadline: DD-MM, HH:MM">
+Status icons: 🔴 Yuqori/P0 · 🟠 Muhim/P1 · ⚪ Rejadagi/P2-P3.
 
 DATA SOURCE:
 - If the principal's message describes a situation, plan around THAT.
-- If the message is EMPTY, build the plan from the CURRENT PRINCIPAL STATE block —
-  the REAL active tasks, today/this-week meetings, overdue and blocked items, and
-  deadlines. Prioritize them, time-block around fixed meetings, flag conflicts.
-  NEVER invent tasks or meetings that aren't in the state block. If the state is
-  empty, say so briefly and suggest adding tasks — don't fabricate a fake day.
+- If EMPTY, build from the CURRENT PRINCIPAL STATE block — REAL active tasks (with their
+  `assignee` for YUK BALANSI), today/this-week meetings, overdue and blocked items,
+  deadlines. NEVER invent tasks, people, or dates. If state is empty, say so briefly and
+  suggest adding tasks — don't fabricate a day.
 
-FORMAT — Telegram-friendly, NO markdown tables (they render as raw pipes on mobile):
-- Use emoji + section headers + "━━━" dividers + short lines.
-- Tasks: "🔴 1. <title> — <P-level>\\n   👤 <mas'ul> · ⏰ <deadline>" (one per block).
-- Time plan: "  HH:MM–HH:MM  <ish>" lines (not a table).
-- Status icons: 🔴 P0 / 🔴 Fixed / 🟠 P1 / 🔵 P2 / ⚪ P3.
-
-Key reminders:
-- Telegram messages (section D) MUST be rasmiy (formal).
-- Flag time conflicts; recommend delegation when windows are tight.
-- 3 clarifying questions in section J ONLY.
-
-Output: user_message = full plan (Telegram-friendly, NO tables); actions=[].
+FORMAT — Telegram-friendly, NO markdown tables: "**bold**" headers, "━━━" dividers, blank line between cards.
+Output: user_message = full board (template above); actions=[].
 """
 
 
 async def _run_planning_session(message: Message, situation: str) -> None:
+    # A long Opus plan that lands ~30s later with zero feedback reads as
+    # "broken". Stream it so the plan visibly builds, exactly like the main
+    # chat path. The directive routes to Opus via its "executive_plan" keyword.
+    directive = _PLAN_DIRECTIVE
+    if situation and situation.strip():
+        # The principal typed/dictated a situation — feed it in. (Previously this
+        # was silently dropped: an internal_directive overrides user_text, so the
+        # free-text `/plan <vaziyat>` was ignored and only the DB was planned.)
+        directive = _PLAN_DIRECTIVE + "\n\n## PRINTSIPAL YOZGAN VAZIYAT\n" + situation.strip()
+
     typing_task = asyncio.create_task(_keep_typing(message.bot, message.chat.id))
+    progress_msg: Message | None = None
+    last_edit_at = 0.0
+    last_edit_text = ""
+    loop = asyncio.get_event_loop()
+    response: dict | None = None
     try:
-        response = await claude_service.process_message(
-            situation, internal_directive=_PLAN_DIRECTIVE,
-        )
+        async for kind, payload in claude_service.process_message_stream(
+            "", internal_directive=directive,
+        ):
+            if kind == "partial":
+                text = (payload or "").strip()
+                if not text:
+                    continue
+                now = loop.time()
+                if (now - last_edit_at) < _STREAM_EDIT_MIN_INTERVAL_SEC:
+                    continue
+                if abs(len(text) - len(last_edit_text)) < _STREAM_EDIT_MIN_DELTA_CHARS:
+                    continue
+                # Partials go out WITHOUT parse_mode — mid-stream markdown is
+                # often unbalanced (open ** with no close) and would 400.
+                if progress_msg is None:
+                    progress_msg = await message.answer(text + " ▌")
+                else:
+                    try:
+                        await progress_msg.edit_text(text + " ▌")
+                    except TelegramBadRequest:
+                        pass
+                last_edit_at = now
+                last_edit_text = text
+            elif kind == "complete":
+                response = payload
+                break
     finally:
         typing_task.cancel()
 
+    if response is None:
+        response = claude_service._FALLBACK_RESPONSE
     plan_text = response.get("user_message", "")
     if not plan_text:
+        if progress_msg is not None:
+            try:
+                await progress_msg.delete()
+            except TelegramBadRequest:
+                pass
         await message.answer("Reja yaratib boʻlmadi. Qaytadan urinib koʻring.")
         return
 
@@ -4940,14 +5566,32 @@ async def _run_planning_session(message: Message, situation: str) -> None:
     ], [
         back_button(),
     ]])
-    await _safe_answer(message, plan_text, parse_mode="Markdown", reply_markup=kb)
+    # Finalize: drop the cursor, render markdown, attach buttons. A board longer
+    # than one Telegram message can't be edited into the streamed bubble
+    # (edit_text 400s past ~4096 chars), so in that case — or if the markdown
+    # edit fails — delete the stale bubble and send the board split at section
+    # boundaries via _safe_answer, instead of orphaning a truncated stream bubble.
+    edited = False
+    if progress_msg is not None and len(plan_text) <= _TG_SOFT_LIMIT:
+        try:
+            await progress_msg.edit_text(plan_text, parse_mode="Markdown", reply_markup=kb)
+            edited = True
+        except TelegramBadRequest:
+            edited = False
+    if not edited:
+        if progress_msg is not None:
+            try:
+                await progress_msg.delete()
+            except TelegramBadRequest:
+                pass
+        await _safe_answer(message, plan_text, parse_mode="Markdown", reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("plan_accept:"))
 async def cb_plan_accept(query: CallbackQuery) -> None:
     plan_id = query.data.split(":", 1)[1]
     await database.mark_plan_accepted(plan_id)
-    await query.answer("Reja qabul qilindi ✅ 2 kun ichida qanday o'tganini so'rayman.")
+    await query.answer("Reja qabul qilindi ✅")
     try:
         await query.message.edit_reply_markup(reply_markup=single_back_keyboard())
     except Exception:
@@ -5659,7 +6303,7 @@ def _risks_sublist(title_line: str, tasks: list[dict],
     lines = [title_line, _SEP, ""]
     nums: list[InlineKeyboardButton] = []
     for i, t in enumerate(tasks[:10], start=1):
-        badge = _PRIORITY_BADGE.get(t.get("priority", "P2"), "🔵")
+        badge = _task_badge(t)  # unified with the list — same dot for the same task
         title = (t.get("title") or "—").strip()
         deadline_label, _ovd = _format_deadline_short(t.get("deadline"))
         assignee = (t.get("assignee") or "").strip() or "belgilanmagan"
@@ -7480,11 +8124,9 @@ async def cb_actions_confirm(query: CallbackQuery, state: FSMContext) -> None:
         pass
     try:
         ids_by_type = await _execute_actions(response.get("actions", []))
-    except Exception:
+    except Exception as e:
         logger.exception("Deferred _execute_actions failed after confirm")
-        await query.message.answer(
-            "❌ Yaratishda xato yuz berdi. Logni tekshiring (/diagnostics)."
-        )
+        await query.message.answer(_humanize_error(e))
         return
     # If this came from a note-analyze confirm, mark the source note processed.
     if note_id:
@@ -9688,7 +10330,7 @@ async def handle_inline_query(query: InlineQuery) -> None:
         try:
             search_results = await database.search_all(q, limit=8)
             for t in search_results.get("tasks", [])[:5]:
-                badge = _PRIORITY_BADGE.get(t.get("priority", "P2"), "🔵")
+                badge = _task_badge(t)  # unified with the list — same dot for the same task
                 deadline_label, _ = _format_deadline_short(t.get("deadline"))
                 results.append(InlineQueryResultArticle(
                     id=f"task:{t['id']}",

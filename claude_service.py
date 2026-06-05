@@ -72,10 +72,24 @@ def _circuit_record_success() -> None:
 # Internal-directive keywords that signal complex reasoning and benefit from Opus.
 # Anything not on this list (and not explicitly forced via complexity="fast"|"complex")
 # uses the default CLAUDE_MODEL (Sonnet).
-_COMPLEX_DIRECTIVE_KEYWORDS = ("executive_plan", "check_followups", "risk_analysis")
+#
+# NOTE: check_followups was deliberately removed. It is a routine 4×/day state scan
+# with tiny output (~115 tokens) but ran on Opus and drove ~70% of total LLM spend.
+# Sonnet handles it at ~1/5 the cost with no quality loss, and two of its three
+# checks are already covered by cheaper jobs (_post_meeting_followup_sweep and the
+# nightly Haiku _proactive_dependency_check). Don't re-add without a cost review.
+_COMPLEX_DIRECTIVE_KEYWORDS = ("executive_plan", "risk_analysis")
 
 
 _MAX_HISTORY_TOKENS_APPROX = 2000  # ~4 chars/token heuristic
+
+# Output token ceiling. A single message may ask to create many tasks at once
+# (e.g. a pasted list of 14). At ~120 tokens per task object, the old 1500 cap
+# truncated the JSON mid-array — the response failed to parse and the user saw
+# "Texnik xato". 8000 fits ~40 task objects with headroom and is within both
+# Sonnet 4.6 and Opus 4.8 default output limits. Cost is unaffected (billing is
+# per token GENERATED, not per ceiling), so a short reply still bills tiny.
+_MAX_OUTPUT_TOKENS = 8000
 
 
 def _budget_history(history: list[dict], max_tokens: int = _MAX_HISTORY_TOKENS_APPROX) -> list[dict]:
@@ -144,7 +158,11 @@ async def _build_state_block() -> str:
 
     def task_line(t: dict) -> str:
         deadline = t.get("deadline") or "no deadline"
-        return f"  - [{t['priority']}] {t['title']} (deadline: {deadline}, status: {t['status']}, id: {t['id']})"
+        # assignee drives the /plan YUK BALANSI (load/bottleneck) view; "—" = the
+        # principal's own task. Never omit it — the planner counts per-owner load.
+        assignee = (t.get("assignee") or "").strip() or "—"
+        return (f"  - [{t['priority']}] {t['title']} "
+                f"(deadline: {deadline}, status: {t['status']}, assignee: {assignee}, id: {t['id']})")
 
     def meeting_line(m: dict) -> str:
         return f"  - {m['datetime_start']} — {m['title']} (participants: {', '.join(m.get('participants', []))}, id: {m['id']})"
@@ -162,6 +180,31 @@ async def _build_state_block() -> str:
         return f"  - {c.get('correction', '')[:120]} (reason: {c.get('reason', '')[:80]})"
 
     blocked = sum(1 for t in active_tasks if t.get("status") == "blocked")
+
+    # Per-assignee load — PRECOMPUTED so /plan's YUK BALANSI uses exact counts
+    # instead of the model re-counting task lines (which slips, e.g. 7 vs 8) and
+    # undermines a feature whose whole point is "who is overloaded". "—" = the
+    # principal's own / unassigned tasks. "soon" = P0 OR due by end of tomorrow.
+    soon_cutoff = today_start + timedelta(days=2)
+    load: dict[str, dict] = {}
+    for t in active_tasks:
+        who = (t.get("assignee") or "").strip() or "—"
+        entry = load.setdefault(who, {"total": 0, "soon": 0})
+        entry["total"] += 1
+        is_soon = t.get("priority") == "P0"
+        dl = t.get("deadline")
+        if dl and not is_soon:
+            try:
+                is_soon = datetime.fromisoformat(dl) < soon_cutoff
+            except (ValueError, TypeError):
+                pass
+        if is_soon:
+            entry["soon"] += 1
+
+    def load_line(item) -> str:
+        who, e = item
+        return f"  - {who}: {e['total']} active ({e['soon']} urgent/soon)"
+
     lines = [
         "# CURRENT PRINCIPAL STATE (real DB snapshot — do NOT invent anything beyond this)",
         "",
@@ -175,6 +218,9 @@ async def _build_state_block() -> str:
         f"reminders_scheduled: {len(reminders)}",
         f"notes_inbox: {notes_inbox}",
         "",
+        f"## LOAD BY ASSIGNEE ({len(load)} owners — EXACT counts for /plan YUK BALANSI; '—' = principal's own)",
+        *(load_line(it) for it in sorted(load.items(), key=lambda kv: -kv[1]["total"])),
+        "  (none)" if not load else "",
         f"## ACTIVE TASKS ({len(active_tasks)} total, showing up to 25)",
         *(task_line(t) for t in active_tasks[:25]),
         "  (none)" if not active_tasks else "",
@@ -324,7 +370,11 @@ async def process_message(
     else:
         history = await database.recent_messages(limit=10)
         history = _budget_history(history)
-        messages = [{"role": m["role"], "content": m["content"]} for m in history]
+        # Drop any empty-content rows — the Anthropic API rejects empty messages
+        # ("messages.N: ... must have non-empty content"), which would 400 the
+        # whole call. Defense-in-depth alongside not persisting internal directives.
+        messages = [{"role": m["role"], "content": m["content"]}
+                    for m in history if (m.get("content") or "").strip()]
 
     # Redact PII for BOTH user messages and internal directives. Internal directives
     # are generated server-side but may interpolate state (task titles, meeting
@@ -342,7 +392,7 @@ async def process_message(
     input_chars = len(outgoing_content)
 
     try:
-        max_tokens = 4000 if internal_directive and "executive_plan" in internal_directive else 1500
+        max_tokens = _MAX_OUTPUT_TOKENS
         response = await _client.messages.create(
             model=model,
             max_tokens=max_tokens,
@@ -435,7 +485,7 @@ async def process_message(
 
     if not internal_directive:
         await database.append_message("user", user_text)
-        await database.append_message("assistant", parsed.get("user_message", ""))
+        await database.append_message("assistant", parsed.get("user_message") or "✅")
         await database.trim_history(keep=30)
 
     return parsed
@@ -447,6 +497,7 @@ async def process_message(
 async def process_message_stream(
     user_text: str,
     complexity: Optional[str] = None,
+    internal_directive: Optional[str] = None,
 ) -> AsyncIterator[Tuple[str, object]]:
     """Streaming variant of process_message for the interactive user path.
 
@@ -458,22 +509,32 @@ async def process_message_stream(
         ("complete", dict) — the final, fully-parsed JSON envelope. Same shape
                               as process_message() returns.
 
-    Internal directives (briefings etc.) intentionally do NOT use streaming —
-    they don't have a user actively waiting and the JSON envelope contract
-    is easier to handle in a single shot. This function is only safe for the
-    "user typed something" path.
+    `internal_directive` streams a server-generated directive (e.g. /plan's
+    executive_plan) the SAME way — there IS a user waiting, and a long Opus
+    plan that appears 33s later with zero feedback reads as "broken". Streaming
+    shows the plan building live. As in process_message, an internal directive
+    skips conversation history (the directive carries its own context via the
+    state block) to avoid hallucinating chat-only items.
 
     Falls back to the non-streaming path on any unrecoverable error (yields
     a single ("complete", fallback_dict))."""
 
-    model = _pick_model(complexity, None)
+    model = _pick_model(complexity, internal_directive)
     state_block = await _build_state_block()
-    history = await database.recent_messages(limit=10)
-    history = _budget_history(history)
-    messages = [{"role": m["role"], "content": m["content"]} for m in history]
-
-    outgoing_content, redacted_count = redaction.redact(user_text)
-    purpose = "user_message_stream"
+    if internal_directive:
+        messages = []
+        outgoing_content, redacted_count = redaction.redact(internal_directive)
+        purpose = "internal_stream:" + internal_directive[:40]
+    else:
+        history = await database.recent_messages(limit=10)
+        history = _budget_history(history)
+        # Drop any empty-content rows — the Anthropic API rejects empty messages
+        # ("messages.N: ... must have non-empty content"), which would 400 the
+        # whole call. Defense-in-depth alongside not persisting internal directives.
+        messages = [{"role": m["role"], "content": m["content"]}
+                    for m in history if (m.get("content") or "").strip()]
+        outgoing_content, redacted_count = redaction.redact(user_text)
+        purpose = "user_message_stream"
     messages.append({"role": "user", "content": outgoing_content})
 
     input_hash = redaction.hash_input(outgoing_content)
@@ -485,7 +546,7 @@ async def process_message_stream(
     try:
         async with _client.messages.stream(
             model=model,
-            max_tokens=1500,
+            max_tokens=_MAX_OUTPUT_TOKENS,
             system=[
                 {
                     "type": "text",
@@ -510,7 +571,7 @@ async def process_message_stream(
     except (RateLimitError, AuthenticationError, BadRequestError,
              APITimeoutError, APIConnectionError, APIStatusError, APIError) as e:
         logger.warning("Streaming Claude failed (%s) — falling back to non-streaming", type(e).__name__)
-        fallback = await process_message(user_text, complexity=complexity)
+        fallback = await process_message(user_text, complexity=complexity, internal_directive=internal_directive)
         yield ("complete", fallback)
         return
 
@@ -540,8 +601,11 @@ async def process_message_stream(
     parsed.setdefault("needs_clarification", False)
     parsed.setdefault("clarification_question", None)
 
-    await database.append_message("user", user_text)
-    await database.append_message("assistant", parsed.get("user_message", ""))
-    await database.trim_history(keep=30)
+    # Never persist internal directives (plans/briefings) — their user_text is ""
+    # which would poison history with an empty message and 400 the next API call.
+    if not internal_directive:
+        await database.append_message("user", user_text)
+        await database.append_message("assistant", parsed.get("user_message") or "✅")
+        await database.trim_history(keep=30)
 
     yield ("complete", parsed)

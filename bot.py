@@ -47,6 +47,7 @@ async def _register_bot_commands(bot: Bot) -> None:
         BotCommand(command="new", description="➕ Yangi vazifa"),
         BotCommand(command="meetings", description="🤝 Uchrashuvlar"),
         BotCommand(command="stats", description="📊 Statistika"),
+        BotCommand(command="export", description="📤 Vazifalarni eksport (Excel)"),
         BotCommand(command="search", description="🔍 Qidiruv"),
         BotCommand(command="plan", description="🎯 Executive reja"),
         BotCommand(command="settings", description="⚙️ Sozlamalar"),
@@ -146,10 +147,10 @@ async def main() -> None:
             pass
         if chat_id is not None:
             try:
-                await bot.send_message(
-                    chat_id,
-                    "⚠️ Texnik xato yuz berdi. Iltimos, qaytadan urinib ko'ring.",
-                )
+                # Surface the real root cause (single-user bot) instead of a
+                # generic "Texnik xato" — handlers._humanize_error maps the
+                # exception to a clear O'zbek reason (plain text, always delivers).
+                await bot.send_message(chat_id, handlers._humanize_error(event.exception))
             except Exception:
                 logger.debug("Could not deliver error notice to user")
         return True  # handled — stop propagation
