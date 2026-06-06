@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     priority TEXT CHECK(priority IN ('P0','P1','P2','P3')) DEFAULT 'P2',
     status TEXT CHECK(status IN ('todo','in_progress','blocked','done','cancelled')) DEFAULT 'todo',
     tags TEXT,
+    category TEXT,
     assignee TEXT,
     recurrence_rule TEXT,
     recurrence_next_at TEXT,
@@ -258,6 +259,26 @@ CREATE TABLE IF NOT EXISTS pending_actions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_state ON pending_actions(state, updated_at);
+
+-- Inline ulashish matn keshi (token=id → matn). Sayqallangan matn/protokol inline
+-- orqali ulashilganda matn shu yerda saqlanadi — bot qayta ishga tushganda
+-- yo'qolmaydi (avval xotirada edi → 'ssilka yo'qolib ketardi').
+CREATE TABLE IF NOT EXISTS share_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- First-class task categories (icon, sort order, archive). tasks.category links
+-- by NAME (loose) — derived/auto category strings still work even without a row.
+CREATE TABLE IF NOT EXISTS categories (
+    name TEXT PRIMARY KEY,
+    icon TEXT,
+    archived INTEGER NOT NULL DEFAULT 0,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -286,10 +307,11 @@ async def init() -> None:
         task_cols = {row[1] for row in await cur.fetchall()}
         if "assignee" not in task_cols:
             await db.execute("ALTER TABLE tasks ADD COLUMN assignee TEXT")
-        for col in ("recurrence_rule", "recurrence_next_at", "recurrence_parent_id"):
+        for col in ("recurrence_rule", "recurrence_next_at", "recurrence_parent_id", "category"):
             if col not in task_cols:
                 await db.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_tasks_recurrence ON tasks(recurrence_rule, recurrence_next_at)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_tasks_category ON tasks(category)")
 
         for col in ("prep_sent_at", "followup_sent_at", "completed_at"):
             if col not in meeting_cols:
@@ -335,10 +357,10 @@ async def create_task(data: dict) -> str:
         recurrence_next_at = compute_next_recurrence(data.get("deadline"), recurrence_rule)
     async with aiosqlite.connect(config.DATABASE_PATH) as db:
         await db.execute(
-            """INSERT INTO tasks (id, title, description, deadline, priority, status, tags, assignee,
+            """INSERT INTO tasks (id, title, description, deadline, priority, status, tags, category, assignee,
                                   recurrence_rule, recurrence_next_at, recurrence_parent_id,
                                   source, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 task_id,
                 data.get("title", "Vazifa"),
@@ -347,6 +369,7 @@ async def create_task(data: dict) -> str:
                 data.get("priority", "P2"),
                 data.get("status", "todo"),
                 json.dumps(data.get("tags", []), ensure_ascii=False),
+                (data.get("category") or None),
                 data.get("assignee"),
                 recurrence_rule,
                 recurrence_next_at,
@@ -378,7 +401,7 @@ async def update_task(task_id: str, data: dict, source: str = "manual") -> bool:
         changes: list[tuple[str, str, str]] = []  # (field, old, new)
         for key in (
             "title", "description", "deadline", "priority", "status", "source", "assignee",
-            "recurrence_rule", "recurrence_next_at", "recurrence_parent_id",
+            "category", "recurrence_rule", "recurrence_next_at", "recurrence_parent_id",
         ):
             if key in data:
                 if key == "recurrence_rule":
@@ -452,6 +475,9 @@ def normalize_recurrence_rule(raw: Any) -> Optional[str]:
     value = str(raw).strip().lower().replace("_", " ").replace("-", " ")
     aliases = {
         "daily": "daily", "every day": "daily", "har kuni": "daily", "kunlik": "daily",
+        "weekdays": "weekdays", "weekday": "weekdays", "every weekday": "weekdays",
+        "ish kunlari": "weekdays", "ish kuni": "weekdays", "har ish kuni": "weekdays",
+        "dushanba juma": "weekdays", "dush juma": "weekdays",
         "weekly": "weekly", "every week": "weekly", "har hafta": "weekly", "haftalik": "weekly",
         "monthly": "monthly", "every month": "monthly", "har oy": "monthly", "oylik": "monthly",
         "quarterly": "quarterly", "every quarter": "quarterly", "har chorak": "quarterly", "choraklik": "quarterly",
@@ -508,6 +534,11 @@ def compute_next_recurrence(base_iso: Optional[str], recurrence_rule: Optional[s
     for _ in range(36):
         if rule == "daily":
             current += timedelta(days=1)
+        elif rule == "weekdays":
+            # Keyingi ish kuni — shanba/yakshanbani o'tkazib yuboradi.
+            current += timedelta(days=1)
+            while current.weekday() >= 5:  # 5=shanba, 6=yakshanba
+                current += timedelta(days=1)
         elif rule == "weekly":
             current += timedelta(weeks=1)
         elif rule == "monthly":
@@ -657,6 +688,228 @@ async def list_tasks(status_in: Optional[list[str]] = None, limit: int = 50) -> 
             )
         rows = await cur.fetchall()
         return [_row_to_task(r) for r in rows]
+
+
+async def list_task_categories() -> list[dict]:
+    """Active-task counts per category (for the /tasks 'Kategoriyalar' view).
+    Uncategorized tasks are grouped under '(boshqa)'. Sorted by count desc."""
+    async with aiosqlite.connect(config.DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT COALESCE(NULLIF(TRIM(category), ''), '(boshqa)') AS cat, COUNT(*) AS n
+               FROM tasks
+               WHERE status IN ('todo','in_progress','blocked')
+               GROUP BY cat ORDER BY n DESC, cat ASC""",
+        )
+        return [{"category": r["cat"], "count": r["n"]} for r in await cur.fetchall()]
+
+
+async def list_tasks_by_category(category: str, limit: int = 100) -> list[dict]:
+    """Active tasks in one category ('(boshqa)' = uncategorized)."""
+    async with aiosqlite.connect(config.DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if category == "(boshqa)":
+            where, params = "(category IS NULL OR TRIM(category) = '')", ()
+        else:
+            where, params = "category = ?", (category,)
+        cur = await db.execute(
+            f"""SELECT * FROM tasks
+                WHERE status IN ('todo','in_progress','blocked') AND {where}
+                ORDER BY
+                  CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END,
+                  CASE WHEN deadline IS NULL THEN 1 ELSE 0 END, deadline ASC
+                LIMIT ?""",
+            (*params, limit),
+        )
+        return [_row_to_task(r) for r in await cur.fetchall()]
+
+
+async def count_tasks_in_category(category: str) -> int:
+    """Active-task count in a category ('(boshqa)' = uncategorized)."""
+    async with aiosqlite.connect(config.DATABASE_PATH) as db:
+        if category == "(boshqa)":
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status IN ('todo','in_progress','blocked') "
+                "AND (category IS NULL OR TRIM(category) = '')")
+        else:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status IN ('todo','in_progress','blocked') AND category = ?",
+                (category,))
+        (n,) = await cur.fetchone()
+        return n
+
+
+async def rename_category(old: str, new: str) -> int:
+    """Rename a category across all its tasks. Returns rows changed."""
+    async with aiosqlite.connect(config.DATABASE_PATH) as db:
+        cur = await db.execute(
+            "UPDATE tasks SET category = ?, updated_at = ? WHERE category = ?",
+            ((new or None), now_iso(), old))
+        await db.commit()
+        return cur.rowcount
+
+
+async def clear_category(category: str) -> int:
+    """Remove a category label from its tasks (tasks survive → uncategorized).
+    Returns rows changed. ('(boshqa)' is already uncategorized → no-op.)"""
+    if category == "(boshqa)":
+        return 0
+    async with aiosqlite.connect(config.DATABASE_PATH) as db:
+        cur = await db.execute(
+            "UPDATE tasks SET category = NULL, updated_at = ? WHERE category = ?",
+            (now_iso(), category))
+        await db.commit()
+        return cur.rowcount
+
+
+async def delete_tasks_by_category(category: str) -> int:
+    """Hard-delete ACTIVE tasks in a category ('(boshqa)' = uncategorized).
+    Returns rows deleted. Caller MUST gate this behind a confirmation."""
+    async with aiosqlite.connect(config.DATABASE_PATH) as db:
+        if category == "(boshqa)":
+            cur = await db.execute(
+                "DELETE FROM tasks WHERE status IN ('todo','in_progress','blocked') "
+                "AND (category IS NULL OR TRIM(category) = '')")
+        else:
+            cur = await db.execute(
+                "DELETE FROM tasks WHERE status IN ('todo','in_progress','blocked') AND category = ?",
+                (category,))
+        await db.commit()
+        return cur.rowcount
+
+
+# ─────────────────── CATEGORIES (first-class: icon, order, archive) ───────────────────
+
+async def create_category(name: str, icon: Optional[str] = None) -> bool:
+    """Create a managed category row (may be empty — no tasks yet). Idempotent."""
+    name = (name or "").strip()
+    if not name or name == "(boshqa)":
+        return False
+    async with aiosqlite.connect(config.DATABASE_PATH) as db:
+        cur = await db.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM categories")
+        (order,) = await cur.fetchone()
+        await db.execute(
+            "INSERT OR IGNORE INTO categories (name, icon, archived, sort_order, created_at, updated_at) "
+            "VALUES (?, ?, 0, ?, ?, ?)", (name, icon, order, now_iso(), now_iso()))
+        if icon:
+            await db.execute("UPDATE categories SET icon = ?, updated_at = ? WHERE name = ?",
+                             (icon, now_iso(), name))
+        await db.commit()
+        return True
+
+
+async def get_category(name: str) -> Optional[dict]:
+    async with aiosqlite.connect(config.DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM categories WHERE name = ?", (name,))
+        r = await cur.fetchone()
+        return dict(r) if r else None
+
+
+async def update_category(old: str, new_name: Optional[str] = None, icon: Optional[str] = None) -> bool:
+    """Rename a category (cascades to tasks.category) and/or set its icon.
+    Auto-creates a row for derived/orphan categories so they become managed."""
+    old = (old or "").strip()
+    if not old:
+        return False
+    await create_category(old)  # ensure a row exists for orphans
+    target = old
+    async with aiosqlite.connect(config.DATABASE_PATH) as db:
+        if new_name and new_name.strip() and new_name.strip() != old:
+            new = new_name.strip()[:60]
+            cur = await db.execute("SELECT 1 FROM categories WHERE name = ?", (new,))
+            if await cur.fetchone():          # target name exists → merge
+                await db.execute("DELETE FROM categories WHERE name = ?", (old,))
+            else:
+                await db.execute("UPDATE categories SET name = ?, updated_at = ? WHERE name = ?",
+                                 (new, now_iso(), old))
+            await db.execute("UPDATE tasks SET category = ?, updated_at = ? WHERE category = ?",
+                             (new, now_iso(), old))
+            target = new
+        if icon is not None:
+            await db.execute("UPDATE categories SET icon = ?, updated_at = ? WHERE name = ?",
+                             (icon, now_iso(), target))
+        await db.commit()
+    return True
+
+
+async def archive_category(name: str, archived: bool = True) -> bool:
+    """Archive/unarchive a category — hidden from the active list, tasks preserved."""
+    name = (name or "").strip()
+    if not name or name == "(boshqa)":
+        return False
+    await create_category(name)
+    async with aiosqlite.connect(config.DATABASE_PATH) as db:
+        await db.execute("UPDATE categories SET archived = ?, updated_at = ? WHERE name = ?",
+                         (1 if archived else 0, now_iso(), name))
+        await db.commit()
+    return True
+
+
+async def delete_category_record(name: str) -> int:
+    """Remove a category's METADATA row (icon/order/archive). Tasks are untouched
+    here — the caller decides whether to clear labels or delete tasks."""
+    async with aiosqlite.connect(config.DATABASE_PATH) as db:
+        cur = await db.execute("DELETE FROM categories WHERE name = ?", (name,))
+        await db.commit()
+        return cur.rowcount
+
+
+async def list_categories(include_archived: bool = False) -> list[dict]:
+    """Merged view: managed rows (icon/order/archived) + derived task-category
+    strings that have no row yet. Returns active-task counts. include_archived=True
+    returns ONLY archived categories (for the archive view)."""
+    async with aiosqlite.connect(config.DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT name, icon, archived, sort_order FROM categories")
+        rows = {r["name"]: dict(r) for r in await cur.fetchall()}
+        cur = await db.execute(
+            "SELECT COALESCE(NULLIF(TRIM(category), ''), '(boshqa)') AS cat, COUNT(*) AS n "
+            "FROM tasks WHERE status IN ('todo','in_progress','blocked') GROUP BY cat")
+        counts = {r["cat"]: r["n"] for r in await cur.fetchall()}
+    out, seen = [], set()
+    for name, r in rows.items():
+        is_arch = bool(r["archived"])
+        if is_arch != include_archived:
+            continue
+        out.append({"name": name, "icon": r["icon"] or "📁", "count": counts.get(name, 0),
+                    "archived": is_arch, "sort_order": r["sort_order"]})
+        seen.add(name)
+    if not include_archived:
+        for cat, n in counts.items():
+            if cat in seen or cat == "(boshqa)":
+                continue
+            out.append({"name": cat, "icon": "📁", "count": n, "archived": False, "sort_order": 9999})
+        if counts.get("(boshqa)"):
+            out.append({"name": "(boshqa)", "icon": "📂", "count": counts["(boshqa)"],
+                        "archived": False, "sort_order": 1_000_000})
+    out.sort(key=lambda c: (c["sort_order"], -c["count"], c["name"]))
+    return out
+
+
+async def move_category(name: str, direction: str) -> bool:
+    """Reorder a category up/down by swapping sort_order with its active neighbour."""
+    if name == "(boshqa)":
+        return False
+    active = [c for c in await list_categories(include_archived=False) if c["name"] != "(boshqa)"]
+    # ensure every active category has a real row (distinct sort_order)
+    for c in active:
+        await create_category(c["name"])
+    fresh = [c for c in await list_categories(include_archived=False) if c["name"] != "(boshqa)"]
+    idx = next((i for i, c in enumerate(fresh) if c["name"] == name), None)
+    if idx is None:
+        return False
+    j = idx - 1 if direction == "up" else idx + 1
+    if j < 0 or j >= len(fresh):
+        return False
+    a, b = fresh[idx], fresh[j]
+    async with aiosqlite.connect(config.DATABASE_PATH) as db:
+        await db.execute("UPDATE categories SET sort_order = ?, updated_at = ? WHERE name = ?",
+                         (b["sort_order"], now_iso(), a["name"]))
+        await db.execute("UPDATE categories SET sort_order = ?, updated_at = ? WHERE name = ?",
+                         (a["sort_order"], now_iso(), b["name"]))
+        await db.commit()
+    return True
 
 
 async def list_today_tasks() -> list[dict]:
@@ -932,24 +1185,26 @@ async def assignee_profile(name: str) -> dict:
     }
 
 
-async def list_delegated_open_tasks(limit: int = 20) -> list[dict]:
+async def list_stale_delegations(min_age_days: int = 3, limit: int = 20) -> list[dict]:
+    """Tasks delegated to OTHERS, still open, created >= min_age_days ago —
+    oldest first (with age_days). Used by the daily delegation auto-chase digest."""
     async with aiosqlite.connect(config.DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            """SELECT * FROM tasks
-               WHERE status IN ('todo','in_progress')
+            """SELECT *, julianday('now') - julianday(created_at) AS age_days
+               FROM tasks
+               WHERE status IN ('todo', 'in_progress')
                  AND assignee IS NOT NULL
                  AND LOWER(TRIM(assignee)) NOT IN (
                      '', 'men', 'siz', 'belgilanmagan', '—',
                      'oʻzim', 'o''zim', 'o''z', 'ozim'
                  )
-               ORDER BY
-                 CASE WHEN deadline IS NULL THEN 1 ELSE 0 END,
-                 deadline ASC
+                 AND julianday('now') - julianday(created_at) >= ?
+               ORDER BY age_days DESC
                LIMIT ?""",
-            (limit,),
+            (min_age_days, limit),
         )
-        return [_row_to_task(r) for r in await cur.fetchall()]
+        return [dict(r) for r in await cur.fetchall()]
 
 
 async def list_recurring_tasks(limit: int = 30) -> list[dict]:
@@ -1386,6 +1641,13 @@ async def mark_note_processed(note_id: str, converted_to_type: str,
     })
 
 
+async def mark_note_done(note_id: str) -> bool:
+    """Mark a note processed WITHOUT converting it — 'reviewed, no action needed'.
+    Completes the GTD triage: a note can leave the inbox without becoming a
+    task/reminder. (mark_note_processed requires a conversion link; this doesn't.)"""
+    return await update_note(note_id, {"status": "processed"})
+
+
 # ─────────────────────────────────────────── MEETINGS ───────────────────────────────────────────
 
 def _agenda_to_text(value) -> Optional[str]:
@@ -1641,6 +1903,24 @@ async def list_meetings_in_window(start_iso: str, end_iso: str) -> list[dict]:
         )
         rows = await cur.fetchall()
         return [_row_to_meeting(r) for r in rows]
+
+
+async def list_meetings_with_protocol(limit: int = 100) -> list[dict]:
+    """Meetings whose follow_up_actions hold a saved protocol (bayonnoma) — newest
+    meeting first. The caller filters protocol-text from task-id lists (the same
+    column is reused by the post-meeting task flow). Powers the central
+    'Bayonnomalar' list."""
+    async with aiosqlite.connect(config.DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT * FROM meetings
+               WHERE follow_up_actions IS NOT NULL
+                 AND TRIM(follow_up_actions) NOT IN ('', '[]', 'null')
+               ORDER BY datetime_start DESC
+               LIMIT ?""",
+            (limit,),
+        )
+        return [_row_to_meeting(r) for r in await cur.fetchall()]
 
 
 async def search_all(query: str, limit: int = 30) -> dict:
@@ -2307,6 +2587,33 @@ async def fail_pending_action(pending_id: int, error: str) -> None:
             (error[:500], now_iso(), pending_id),
         )
         await db.commit()
+
+
+async def list_recent_actions(limit: int = 10) -> list[dict]:
+    """Audit trail — recently processed user actions (completed/failed),
+    newest first. Used by the diagnostics 'So'nggi amallar' section."""
+    async with aiosqlite.connect(config.DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT user_text, state, error, created_at, completed_at, updated_at
+               FROM pending_actions
+               WHERE state IN ('completed', 'failed')
+               ORDER BY COALESCE(completed_at, updated_at) DESC
+               LIMIT ?""",
+            (limit,),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def get_share_text(token: str) -> Optional[str]:
+    """Inline ulashish keshidan matnni token (id) bo'yicha o'qiydi. DB-backed —
+    bot restart'da ham yo'qolmaydi."""
+    if not str(token or "").isdigit():
+        return None
+    async with aiosqlite.connect(config.DATABASE_PATH) as db:
+        cur = await db.execute("SELECT content FROM share_cache WHERE id = ?", (int(token),))
+        row = await cur.fetchone()
+        return row[0] if row else None
 
 
 async def list_stuck_pending_actions(stuck_after_minutes: int = 5) -> list[dict]:

@@ -1,0 +1,42 @@
+# Yordamchi — systemd unit. Production'da botni doimo ishlatib turadi:
+# tarmoq uzilsa, qulasa yoki server qayta yuklansa — avtomatik qayta ko'taradi.
+#
+# O'rnatish (serverda, root yoki sudo bilan):
+#   1) Quyidagi YO'LLARNI o'zingiznikiga moslang (WorkingDirectory, ExecStart, User).
+#   2) sudo cp deploy/yordamchi.service /etc/systemd/system/yordamchi.service
+#   3) sudo systemctl daemon-reload
+#   4) sudo systemctl enable --now yordamchi
+#   5) Holatni ko'rish:   systemctl status yordamchi
+#      Loglar:            journalctl -u yordamchi -f
+#   Qayta ishga tushirish: sudo systemctl restart yordamchi
+#
+# Eslatma: single-instance lock (data/yordamchi.lock) tufayli xizmat ishlab
+# turganда qo'lда `python bot.py` ishga tushsa, u darrov chiqib ketadi —
+# konflikt bo'lmaydi.
+
+[Unit]
+Description=Yordamchi — Telegram AI yordamchi bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yordamchi
+WorkingDirectory=/opt/yordamchi
+# .env fayl shu yerda bo'lsin (TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, ...).
+EnvironmentFile=/opt/yordamchi/.env
+ExecStart=/opt/yordamchi/venv/bin/python bot.py
+
+# Avtomatik qayta ishga tushirish — har qanday qulashda 5s dan keyin.
+Restart=always
+RestartSec=5
+# Tez-tez qulasa ham urinishni to'xtatmaslik (start-limit'ni o'chirish).
+StartLimitIntervalSec=0
+
+# Loglar journald'ga (journalctl -u yordamchi).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=yordamchi
+
+[Install]
+WantedBy=multi-user.target

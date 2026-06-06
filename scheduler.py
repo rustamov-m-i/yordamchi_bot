@@ -186,6 +186,14 @@ class YordamchiScheduler:
             id="proactive_dependency_check",
             replace_existing=True,
         )
+        # Daily 09:30 — delegation auto-chase: nudge about tasks delegated to
+        # others that have been open too long. Pushes only when stale ones exist.
+        self.scheduler.add_job(
+            self._stale_delegation_digest,
+            CronTrigger(hour=9, minute=30, timezone=config.TIMEZONE),
+            id="stale_delegation_digest",
+            replace_existing=True,
+        )
 
         if config.ICLOUD_ENABLED:
             self.scheduler.add_job(
@@ -502,6 +510,31 @@ class YordamchiScheduler:
                 await self._send("🔗 **VAZIFA BOG'LANISHLARI**\n\n" + text)
         except Exception:
             logger.exception("Proactive dependency check failed")
+
+    async def _stale_delegation_digest(self) -> None:
+        """Daily delegation auto-chase — surface tasks delegated to others that
+        have been open >= 3 days so the principal follows up. No LLM, no spam:
+        pushes only when stale delegations exist."""
+        try:
+            stale = await database.list_stale_delegations(min_age_days=3, limit=8)
+            if not stale:
+                return
+            lines = [
+                "📋 **DELEGATSIYA NAZORATI**",
+                "",
+                f"{len(stale)} ta topshiriq uzoq kutyapti — follow-up kerakmi?",
+                "",
+            ]
+            for t in stale:
+                age = int(t.get("age_days") or 0)
+                badge = "🔴" if age >= 7 else "🟠" if age >= 5 else "🟡"
+                who = (t.get("assignee") or "—").strip()
+                title = (t.get("title") or "—").strip()
+                lines.append(f"{badge} «{title[:50]}» — 👤 {who} · ⏱ {age} kun")
+            lines.extend(["", "_Ijrochilar paneli → ⏳ Kutilayotganlar_"])
+            await self._send("\n".join(lines))
+        except Exception:
+            logger.exception("Stale delegation digest failed")
 
     async def _weekly_retrospective(self) -> None:
         """Friday 18:00 — auto-generate the week's retrospective via Claude.

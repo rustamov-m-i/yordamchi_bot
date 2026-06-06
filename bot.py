@@ -4,10 +4,13 @@ Run: python bot.py
 """
 
 import asyncio
+import fcntl
 import logging
+import os
 import signal
 import sys
 import warnings
+from pathlib import Path
 
 # Silence noisy third-party logs that aren't actionable for us:
 # - urllib3-future emits a WARNING when a server advertises HTTP/3 via Alt-Svc
@@ -33,6 +36,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger("yordamchi")
 
+# Single-instance guard: an exclusive advisory lock on a file in the data dir.
+# Prevents two bot processes from polling the same token at once (Telegram
+# returns "Conflict: terminated by other getUpdates" and both thrash). The lock
+# is released automatically when the process exits (the fd is closed by the OS).
+_INSTANCE_LOCK_FH = None
+
+
+def _acquire_single_instance_lock() -> bool:
+    """Return True if we got the lock; False if another instance holds it."""
+    global _INSTANCE_LOCK_FH
+    lock_path = Path(config.DATABASE_PATH).parent / "yordamchi.lock"
+    try:
+        fh = open(lock_path, "w")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fh.write(str(os.getpid()))
+        fh.flush()
+        _INSTANCE_LOCK_FH = fh  # keep the handle alive for the process lifetime
+        return True
+    except (BlockingIOError, OSError):
+        return False
+
 
 async def _register_bot_commands(bot: Bot) -> None:
     """Register the slash-command list shown in Telegram's command picker."""
@@ -40,20 +64,21 @@ async def _register_bot_commands(bot: Bot) -> None:
         BotCommand(command="cockpit", description="🎛 Boshqaruv paneli"),
         BotCommand(command="today", description="📅 Bugungi briefing"),
         BotCommand(command="tasks", description="📌 Vazifalar"),
+        BotCommand(command="categories", description="🗄 Kategoriyalar"),
         BotCommand(command="reminders", description="⏰ Eslatmalar"),
-        BotCommand(command="notes", description="📝 Notes (Inbox)"),
+        BotCommand(command="notes", description="📝 Qaydlar (Inbox)"),
         BotCommand(command="team", description="👥 Ijrochilar paneli"),
         BotCommand(command="risks", description="🚨 Risklar paneli"),
         BotCommand(command="new", description="➕ Yangi vazifa"),
         BotCommand(command="meetings", description="🤝 Uchrashuvlar"),
+        BotCommand(command="bayonnomalar", description="📄 Bayonnomalar"),
         BotCommand(command="stats", description="📊 Statistika"),
         BotCommand(command="export", description="📤 Vazifalarni eksport (Excel)"),
         BotCommand(command="search", description="🔍 Qidiruv"),
         BotCommand(command="plan", description="🎯 Executive reja"),
         BotCommand(command="settings", description="⚙️ Sozlamalar"),
         BotCommand(command="calendar", description="📆 iCloud kalendar"),
-        BotCommand(command="delegations", description="👥 Delegatsiyalar trekeri"),
-        BotCommand(command="diagnostics", description="🔍 Bot holati"),
+        BotCommand(command="diagnostics", description="🩺 Bot holati"),
         BotCommand(command="backup", description="💾 Backup yaratish"),
         BotCommand(command="cancel", description="✕ Joriy amalni bekor qilish"),
         BotCommand(command="help", description="Yordam"),
@@ -75,6 +100,11 @@ async def _clear_menu_button(bot: Bot) -> None:
 
 async def main() -> None:
     config.ensure_paths()
+    if not _acquire_single_instance_lock():
+        logger.error(
+            "Another Yordamchi instance is already running (lock held). "
+            "Exiting to avoid a Telegram getUpdates conflict.")
+        sys.exit(1)
     await database.init()
     logger.info("Database initialized")
 
@@ -97,10 +127,14 @@ async def main() -> None:
         logger.exception("pending_actions startup sweep failed (non-fatal)")
 
     # Warm iCloud CalDAV connection cache so the first user-triggered push is sub-second.
+    # Bounded by a timeout: when iCloud is slow/unreachable (flaky network) the prime
+    # must NEVER block bot startup — the bot has to come up and serve Telegram even if
+    # the calendar isn't reachable. The orphaned thread finishes/aborts on its own.
     if config.ICLOUD_ENABLED:
         try:
             import calendar_service
-            cal = await asyncio.to_thread(calendar_service._get_calendar_cached)
+            cal = await asyncio.wait_for(
+                asyncio.to_thread(calendar_service._get_calendar_cached), timeout=8.0)
             if cal:
                 try:
                     cal_name = cal.get_display_name()
@@ -109,6 +143,8 @@ async def main() -> None:
                 logger.info("iCloud cache primed (calendar: %s)", cal_name)
             else:
                 logger.warning("iCloud cache prime returned no calendar")
+        except asyncio.TimeoutError:
+            logger.warning("iCloud cache prime timed out (8s) — starting without it")
         except Exception:
             logger.exception("iCloud cache prime failed (non-fatal)")
 

@@ -161,8 +161,12 @@ async def _build_state_block() -> str:
         # assignee drives the /plan YUK BALANSI (load/bottleneck) view; "—" = the
         # principal's own task. Never omit it — the planner counts per-owner load.
         assignee = (t.get("assignee") or "").strip() or "—"
+        # category shown so Claude REUSES existing category names (consistency)
+        # instead of inventing near-duplicates on each new task.
+        category = (t.get("category") or "").strip() or "—"
         return (f"  - [{t['priority']}] {t['title']} "
-                f"(deadline: {deadline}, status: {t['status']}, assignee: {assignee}, id: {t['id']})")
+                f"(deadline: {deadline}, status: {t['status']}, assignee: {assignee}, "
+                f"category: {category}, id: {t['id']})")
 
     def meeting_line(m: dict) -> str:
         return f"  - {m['datetime_start']} — {m['title']} (participants: {', '.join(m.get('participants', []))}, id: {m['id']})"
@@ -313,6 +317,33 @@ def _fallback(user_message: str) -> dict:
 
 
 _FALLBACK_RESPONSE = _fallback("Texnik xato yuz berdi. Iltimos, qaytadan urinib ko'ring.")
+
+
+def _classify_anthropic_error(e: Exception) -> Tuple[str, str]:
+    """Map an Anthropic SDK exception to (audit_label, O'zbek user message).
+    Mirrors the inline handling in process_message; used by process_document so
+    the document path reports the same root causes (rate limit, credit, etc.)."""
+    if isinstance(e, RateLimitError):
+        return "rate_limit", "Juda ko'p so'rov. Bir-ikki daqiqadan keyin qayta urinib ko'ring."
+    if isinstance(e, AuthenticationError):
+        return "auth", "Claude kalitida muammo. Administrator bilan bog'laning."
+    if isinstance(e, BadRequestError):
+        msg = str(e).lower()
+        if "credit" in msg or "balance" in msg or "billing" in msg:
+            return ("credit_low",
+                    "Claude balansi tugadi. Hisobni to'ldiring: "
+                    "https://console.anthropic.com/settings/billing")
+        return "bad_request", "Texnik xato (bad request). Iltimos, qaytadan urinib ko'ring."
+    if isinstance(e, APITimeoutError):
+        return "timeout", "Javob kech keldi. Qaytadan urinib ko'ring."
+    if isinstance(e, APIConnectionError):
+        return "connection", "Tarmoqqa ulanib bo'lmadi. Bir ozdan keyin qaytadan urinib ko'ring."
+    if isinstance(e, APIStatusError):
+        code = getattr(e, "status_code", None)
+        if code == 529:
+            return f"status_{code}", "Claude vaqtincha band. Bir ozdan keyin qaytadan urinib ko'ring."
+        return f"status_{code}", "Texnik xato yuz berdi. Iltimos, qaytadan urinib ko'ring."
+    return "api_error", "Texnik xato yuz berdi. Iltimos, qaytadan urinib ko'ring."
 
 
 def _envelope_from_raw(raw: str) -> Optional[dict]:
@@ -487,6 +518,111 @@ async def process_message(
         await database.append_message("user", user_text)
         await database.append_message("assistant", parsed.get("user_message") or "✅")
         await database.trim_history(keep=30)
+
+    return parsed
+
+
+async def process_document(
+    instruction: str,
+    content_blocks: list,
+    complexity: Optional[str] = None,
+    file_label: Optional[str] = None,
+) -> dict:
+    """Analyse an uploaded document/image and return the standard JSON envelope.
+
+    `content_blocks` are pre-built Anthropic content blocks (text/image/document)
+    from document_service — prepended to the user turn, followed by `instruction`.
+    Because the return shape matches process_message, handlers can route any
+    create_task / create_reminder actions through the normal confirm pipeline.
+
+    Not streamed: analysis isn't latency-critical and handlers shows a working
+    indicator. A short marker plus the summary are written to conversation history
+    so the principal can ask follow-up questions about the document.
+    """
+    if _circuit_is_open():
+        logger.warning("Anthropic circuit open — short-circuiting document analysis "
+                        "(cooldown remaining: %.0fs)", _circuit_open_until - _time.time())
+        return _fallback(
+            "Claude vaqtinchalik mavjud emas. Bir necha daqiqadan keyin qayta urinib ko'ring. "
+            "Bot boshqa funksiyalari (ro'yxatlar, qidiruv) ishlayapti."
+        )
+
+    model = _pick_model(complexity, None)
+    state_block = await _build_state_block()
+
+    # The instruction is small and server-shaped, but redact it anyway — the
+    # principal's caption may quote a card number / IBAN. (Text extracted from
+    # the file is already redacted upstream in document_service.)
+    instruction_red, redacted_count = redaction.redact(instruction or "")
+    content = list(content_blocks) + [{"type": "text", "text": instruction_red}]
+
+    input_hash = redaction.hash_input(instruction_red)
+    # Only the textual portion is "chars"; binary image/PDF blocks aren't counted.
+    input_chars = sum(len(b.get("text", "")) for b in content if b.get("type") == "text")
+    purpose = "document"
+
+    try:
+        response = await _client.messages.create(
+            model=model,
+            max_tokens=_MAX_OUTPUT_TOKENS,
+            system=[
+                {
+                    "type": "text",
+                    "text": config.SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {"type": "text", "text": state_block},
+            ],
+            messages=[{"role": "user", "content": content}],
+        )
+    except (RateLimitError, AuthenticationError, BadRequestError, APITimeoutError,
+            APIConnectionError, APIStatusError, APIError) as e:
+        label, msg = _classify_anthropic_error(e)
+        if label not in ("rate_limit", "credit_low"):
+            logger.exception("Anthropic document call failed (%s, model=%s)", label, model)
+        await database.log_llm_call(
+            "anthropic", model, purpose, input_hash, input_chars, None, None,
+            redacted_terms_count=redacted_count, error=label,
+        )
+        _circuit_record_failure()
+        return _fallback(msg)
+
+    _circuit_record_success()
+    raw = response.content[0].text if response.content else ""
+
+    usage = getattr(response, "usage", None)
+    in_tokens = getattr(usage, "input_tokens", 0) if usage else 0
+    out_tokens = getattr(usage, "output_tokens", 0) if usage else 0
+    cache_read = getattr(usage, "cache_read_input_tokens", 0) if usage else 0
+    cache_creation = getattr(usage, "cache_creation_input_tokens", 0) if usage else 0
+    cost = redaction.estimate_cost(model, in_tokens, out_tokens, cache_read, cache_creation)
+    await database.log_llm_call(
+        "anthropic", model, purpose, input_hash, input_chars,
+        in_tokens, out_tokens, cache_read, cache_creation,
+        redacted_terms_count=redacted_count, estimated_cost_usd=cost,
+    )
+
+    parsed = _envelope_from_raw(raw)
+    if not parsed:
+        logger.error("Claude (document) returned unusable output: %s", raw[:500])
+        return _FALLBACK_RESPONSE
+
+    parsed.setdefault("intent", "none")
+    parsed.setdefault("actions", [])
+    parsed.setdefault("user_message", "")
+    parsed.setdefault("buttons", [])
+    parsed.setdefault("needs_clarification", False)
+    parsed.setdefault("clarification_question", None)
+
+    # Persist a SHORT marker (not the file contents) + the summary so the
+    # principal can follow up ("3-banddagi muddat qachon?") with context.
+    try:
+        marker = f"[Hujjat yuborildi: {file_label or 'fayl'}] {(instruction or '').strip()[:200]}"
+        await database.append_message("user", marker.strip())
+        await database.append_message("assistant", parsed.get("user_message") or "✅")
+        await database.trim_history(keep=30)
+    except Exception:
+        logger.debug("Could not persist document turn to history")
 
     return parsed
 

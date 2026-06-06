@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -26,6 +27,7 @@ import calendar_service
 import claude_service
 import config
 import database
+import document_service
 import scheduler as scheduler_module
 import voice_service
 
@@ -137,14 +139,15 @@ BTN_BACK_MAIN = "⬅️ Asosiy menyu"
 
 # Section reply labels — prefiks yo'q (toza ko'rinish uchun).
 # Kontekst (qaysi bo'lim) SectionFSM state orqali aniqlanadi.
-TBTN_TASKS_ACTIVE = "Aktiv"
-TBTN_TASKS_TODAY = "Bugun"
-TBTN_TASKS_OVERDUE = "O'tgan"
-TBTN_TASKS_IMPORTANT = "Muhim"
-TBTN_TASKS_DONE = "Bajarilgan"
-TBTN_TASKS_ALL = "Barchasi"
+TBTN_TASKS_ACTIVE = "🔵 Aktiv"
+TBTN_TASKS_TODAY = "📅 Bugun"
+TBTN_TASKS_OVERDUE = "⚠️ O'tgan"
+TBTN_TASKS_IMPORTANT = "⚡ Muhim"
+TBTN_TASKS_DONE = "✅ Bajarilgan"
+TBTN_TASKS_ALL = "📋 Barchasi"
 TBTN_TASKS_NEW = "➕ Yangi vazifa"
 TBTN_TASKS_SEARCH = "🔍 Vazifa qidirish"
+TBTN_TASKS_CATEGORIES = "🗄 Kategoriyalar"
 
 _TASKS_SECTION_FILTERS = {
     TBTN_TASKS_ACTIVE:   "active",
@@ -155,6 +158,10 @@ _TASKS_SECTION_FILTERS = {
     TBTN_TASKS_ALL:      "all",
 }
 
+# Last task filter the principal viewed — so an opened task's "⬅️ Ro'yxatga"
+# returns to THAT filter, not always "active". Single-user bot → module state ok.
+_last_task_filter: str = "active"
+
 MBTN_MEETINGS_WEEK = "Haftalik"
 MBTN_MEETINGS_TODAY = "Bugun"
 MBTN_MEETINGS_TOMORROW = "Ertaga"
@@ -162,6 +169,7 @@ MBTN_MEETINGS_ALL = "Barchasi"
 MBTN_MEETINGS_PAST = "O'tgan"
 MBTN_MEETINGS_NEW = "➕ Yangi uchrashuv"
 MBTN_MEETINGS_SEARCH = "🔍 Uchrashuv qidirish"
+MBTN_MEETINGS_PROTOCOLS = "📄 Bayonnomalar"
 
 _MEETINGS_SECTION_FILTERS = {
     MBTN_MEETINGS_WEEK:     "week",
@@ -174,13 +182,12 @@ _MEETINGS_SECTION_FILTERS = {
 RBTN_REMINDERS_TODAY = "⏰ Bugun"
 RBTN_REMINDERS_UPCOMING = "⏭ Keyingi"
 RBTN_REMINDERS_SENT = "📤 Yuborilgan"
-RBTN_REMINDERS_ALL = "🗂 Barchasi"
+RBTN_REMINDERS_ALL = "📋 Barchasi"
 RBTN_REMINDERS_NEW = "➕ Yangi eslatma"
 RBTN_REMINDERS_SEARCH = "🔍 Eslatma qidirish"
 
 _REMINDERS_SECTION_FILTERS = {
     RBTN_REMINDERS_TODAY: "today",
-    RBTN_REMINDERS_UPCOMING: "upcoming",
     RBTN_REMINDERS_SENT: "sent",
     RBTN_REMINDERS_ALL: "all",
 }
@@ -189,8 +196,8 @@ _REMINDERS_SECTION_FILTERS = {
 NBTN_NOTES_INBOX = "📥 Inbox"
 NBTN_NOTES_PROCESSED = "⚙️ Ishlangan"
 NBTN_NOTES_ARCHIVED = "📦 Arxiv"
-NBTN_NOTES_NEW = "➕ Yangi note"
-NBTN_NOTES_SEARCH = "🔍 Note qidirish"
+NBTN_NOTES_NEW = "➕ Yangi qayd"
+NBTN_NOTES_SEARCH = "🔍 Qayd qidirish"
 
 _NOTES_SECTION_FILTERS = {
     NBTN_NOTES_INBOX:     "inbox",
@@ -205,6 +212,15 @@ _NOTES_SOURCE_BADGE = {
     "voice":   "🎙 ovoz",
     "manual":  "✍️ qo'lda",
     "llm":     "🤖 LLM",
+}
+# Emoji-only manba ikonkasi — sana bo'yicha guruhlangan ro'yxatda (Variant B)
+# sarlavha oldida turadi.
+_NOTES_SOURCE_ICON = {
+    "forward": "🔁",
+    "command": "⚡",
+    "voice":   "🎙",
+    "manual":  "✍️",
+    "llm":     "🤖",
 }
 _NOTES_PER_PAGE = 10
 
@@ -228,7 +244,7 @@ class SectionFSM(StatesGroup):
 
 
 class NoteCaptureFSM(StatesGroup):
-    """One-shot FSM for `/qayd` with no body or "➕ Yangi note" button —
+    """One-shot FSM for `/qayd` with no body or "➕ Yangi qayd" button —
     next text/voice message becomes the note content."""
     awaiting_text = State()
 
@@ -250,6 +266,9 @@ _STATS_SECTION_PERIODS = {
 YBTN_TEAM_REFRESH = "🔄 Yangilash"
 YBTN_TEAM_UNASSIGNED = "👤 Ijrochisiz vazifalar"
 YBTN_TEAM_REASSIGN = "🔄 Qayta taqsimlash"
+# Eski "Delegatsiya trekeri" shu yerga ko'chirildi — boshqalarga berilgan
+# vazifalarni eng uzoq kutilgani bo'yicha ko'rsatadi (qotgan topshiriqlar).
+YBTN_TEAM_STALE = "⏳ Kutilayotganlar"
 
 # ── Risklar section labels ──
 RBTN_RISKS_REFRESH = "🔄 Yangilash"
@@ -264,7 +283,7 @@ DBTN_TODAY_MEETINGS = "🤝 Bugungi uchrashuvlar"
 NBTN_NEW_TASK = "📝 Yangi vazifa"
 NBTN_NEW_MEETING = "🤝 Yangi uchrashuv"
 NBTN_NEW_REMINDER = "⏰ Yangi eslatma"
-NBTN_NEW_NOTE = "📥 Yangi note"
+NBTN_NEW_NOTE = "📥 Yangi qayd"
 NBTN_NEW_VOICE = "🎙 Ovozli vazifa"
 NBTN_NEW_POLISH = "✏️ Matn tahrirlash"
 
@@ -296,6 +315,7 @@ def tasks_section_reply_keyboard() -> ReplyKeyboardMarkup:
              KeyboardButton(text=TBTN_TASKS_IMPORTANT)],
             [KeyboardButton(text=TBTN_TASKS_OVERDUE),
              KeyboardButton(text=TBTN_TASKS_DONE)],
+            [KeyboardButton(text=TBTN_TASKS_CATEGORIES)],
             [KeyboardButton(text=TBTN_TASKS_NEW),
              KeyboardButton(text=TBTN_TASKS_SEARCH)],
             [KeyboardButton(text=BTN_BACK_MAIN)],
@@ -314,6 +334,7 @@ def meetings_section_reply_keyboard() -> ReplyKeyboardMarkup:
              KeyboardButton(text=MBTN_MEETINGS_TOMORROW)],
             [KeyboardButton(text=MBTN_MEETINGS_ALL),
              KeyboardButton(text=MBTN_MEETINGS_PAST)],
+            [KeyboardButton(text=MBTN_MEETINGS_PROTOCOLS)],
             [KeyboardButton(text=MBTN_MEETINGS_NEW),
              KeyboardButton(text=MBTN_MEETINGS_SEARCH)],
             [KeyboardButton(text=BTN_BACK_MAIN)],
@@ -328,8 +349,7 @@ def reminders_section_reply_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=RBTN_REMINDERS_TODAY),
-             KeyboardButton(text=RBTN_REMINDERS_UPCOMING)],
-            [KeyboardButton(text=RBTN_REMINDERS_SENT),
+             KeyboardButton(text=RBTN_REMINDERS_SENT),
              KeyboardButton(text=RBTN_REMINDERS_ALL)],
             [KeyboardButton(text=RBTN_REMINDERS_NEW),
              KeyboardButton(text=RBTN_REMINDERS_SEARCH)],
@@ -352,7 +372,7 @@ def notes_section_reply_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=BTN_BACK_MAIN)],
         ],
         resize_keyboard=True, is_persistent=True,
-        input_field_placeholder="Note tanlang yoki yangisini yozing...",
+        input_field_placeholder="Qayd tanlang yoki yangisini yozing...",
     )
 
 
@@ -376,7 +396,8 @@ def team_section_reply_keyboard() -> ReplyKeyboardMarkup:
     """Reply kbd Ijrochilar bo'limida — tezkor amallar."""
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=YBTN_TEAM_UNASSIGNED)],
+            [KeyboardButton(text=YBTN_TEAM_STALE),
+             KeyboardButton(text=YBTN_TEAM_UNASSIGNED)],
             [KeyboardButton(text=YBTN_TEAM_REFRESH),
              KeyboardButton(text=YBTN_TEAM_REASSIGN)],
             [KeyboardButton(text=BTN_BACK_MAIN)],
@@ -469,10 +490,10 @@ _SECTION_LABELS: set[str] = (
     | set(_MEETINGS_SECTION_FILTERS)
     | set(_STATS_SECTION_PERIODS)
     | {TBTN_TASKS_NEW, TBTN_TASKS_SEARCH,
-       MBTN_MEETINGS_NEW, MBTN_MEETINGS_SEARCH,
+       MBTN_MEETINGS_NEW, MBTN_MEETINGS_SEARCH, MBTN_MEETINGS_PROTOCOLS,
        RBTN_REMINDERS_NEW, RBTN_REMINDERS_SEARCH,
        SBTN_STATS_REPORT_WEEK, SBTN_STATS_REPORT_MONTH,
-       YBTN_TEAM_REFRESH, YBTN_TEAM_UNASSIGNED, YBTN_TEAM_REASSIGN,
+       YBTN_TEAM_REFRESH, YBTN_TEAM_UNASSIGNED, YBTN_TEAM_REASSIGN, YBTN_TEAM_STALE,
        RBTN_RISKS_REFRESH,
        DBTN_TODAY_EVENING, DBTN_TODAY_ALL_TASKS, DBTN_TODAY_NEW_TASK, DBTN_TODAY_MEETINGS,
        NBTN_NEW_TASK, NBTN_NEW_MEETING, NBTN_NEW_REMINDER, NBTN_NEW_VOICE, NBTN_NEW_POLISH,
@@ -599,6 +620,13 @@ class CreateActionConfirmFSM(StatesGroup):
     awaiting = State()
 
 
+class DocReviseFSM(StatesGroup):
+    """✏️ Tahrirla — hujjat tahlilini ko'rsatma bo'yicha qayta ishlash (polish
+    revizatsiyasi bilan bir xil konsepsiya). Cache'dagi fayl uid'i
+    state.data['revise_uid']'da; bot SHU faylni yangi ko'rsatma bilan qayta tahlil qiladi."""
+    awaiting = State()
+
+
 class GlobalSearchFSM(StatesGroup):
     """Global search across tasks + meetings."""
     awaiting_query = State()
@@ -640,8 +668,10 @@ def task_edit_menu(task: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📄 Tavsif", callback_data=f"editfield:{tid}:description")],
         [InlineKeyboardButton(text="⚡ Prioritet", callback_data=f"editfield:{tid}:priority")],
         [InlineKeyboardButton(text="📅 Deadline", callback_data=f"editfield:{tid}:deadline")],
+        [InlineKeyboardButton(text="👤 Ijrochi", callback_data=f"set_assignee:{tid}")],
         [InlineKeyboardButton(text="📊 Status", callback_data=f"editfield:{tid}:status")],
         [InlineKeyboardButton(text="🏷 Teglar", callback_data=f"editfield:{tid}:tags")],
+        [InlineKeyboardButton(text="📁 Kategoriya", callback_data=f"editfield:{tid}:category")],
         [InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"taskopen:{tid}")],
     ])
 
@@ -704,11 +734,17 @@ def meeting_inline_actions(meeting: dict) -> InlineKeyboardMarkup:
     """
     mid = meeting["id"]
     if meeting.get("completed_at"):
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📝 Bayonnoma yaratish", callback_data=f"protocol:{mid}")],
-            [InlineKeyboardButton(text="↺ Bo'ldi'ni bekor qilish", callback_data=f"meeting_undone:{mid}")],
-            [back_button("meetingfilter:week", "⬅️ Ro'yxatga")],
-        ])
+        fu = meeting.get("follow_up_actions") or []
+        has_proto = bool(fu) if isinstance(fu, list) else bool(str(fu).strip())
+        rows: list = []
+        if has_proto:  # protocol exists → let the principal VIEW it (was unfindable)
+            rows.append([InlineKeyboardButton(text="📄 Bayonnomani ko'rish", callback_data=f"viewproto:{mid}")])
+            rows.append([InlineKeyboardButton(text="✏️ Qayta tuzish", callback_data=f"protocol:{mid}")])
+        else:
+            rows.append([InlineKeyboardButton(text="📝 Bayonnoma yaratish", callback_data=f"protocol:{mid}")])
+        rows.append([InlineKeyboardButton(text="↺ Bo'ldi'ni bekor qilish", callback_data=f"meeting_undone:{mid}")])
+        rows.append([back_button("meetingfilter:week", "⬅️ Ro'yxatga")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Bo'ldi", callback_data=f"meeting_done:{mid}")],
         [InlineKeyboardButton(text="🔄 Vaqtni o'zgartirish", callback_data=f"reschedule:{mid}")],
@@ -1106,6 +1142,37 @@ async def _execute_actions(actions: list[dict]) -> dict[str, list[str]]:
             elif atype == "delete_all_contacts":
                 n = await database.delete_all_contacts()
                 logger.info("Bulk delete: %d contacts", n)
+            elif atype == "create_category":
+                cat = (data.get("category") or "").strip()
+                if cat:
+                    await database.create_category(cat, data.get("icon"))
+                    logger.info("Created category %r", cat)
+            elif atype == "archive_category":
+                cat = (data.get("category") or "").strip()
+                if cat:
+                    await database.archive_category(cat, bool(data.get("archived", True)))
+                    created_ids["_refresh"].append("task")
+                    logger.info("Archived category %r", cat)
+            elif atype == "delete_category":
+                cat = (data.get("category") or "").strip()
+                if cat:
+                    n = await database.clear_category(cat)
+                    await database.delete_category_record(cat)  # remove metadata row too
+                    created_ids["_refresh"].append("task")
+                    logger.info("Cleared+removed category %r from %d tasks", cat, n)
+            elif atype == "delete_tasks_by_category":
+                cat = (data.get("category") or "").strip()
+                if cat:
+                    n = await database.delete_tasks_by_category(cat)
+                    created_ids["_refresh"].append("task")
+                    logger.info("Deleted %d tasks in category %r", n, cat)
+            elif atype == "assign_category":
+                cat = (data.get("category") or "").strip()
+                frm = (data.get("from_category") or "").strip()
+                if cat and frm:
+                    n = await database.rename_category(frm, cat)
+                    created_ids["_refresh"].append("task")
+                    logger.info("Reassigned %d tasks: %r → %r", n, frm, cat)
             elif atype == "none":
                 pass
             else:
@@ -1230,8 +1297,48 @@ def _resolve_callback(callback: str, ids_by_type: dict[str, list[str]]) -> str |
     return callback
 
 
-def _build_keyboard(buttons: list, ids_by_type: dict[str, list[str]]) -> InlineKeyboardMarkup | None:
-    """Convert Claude's button structure to aiogram InlineKeyboardMarkup."""
+# Inline ulashish uchun matn keshi — endi DB-backed (share_cache jadvali).
+# Avval xotirada edi → bot restart'da token yo'qolib, 'ssilka yo'qolib ketardi'.
+
+
+def _strip_polish_wrapper(raw: str) -> str:
+    """'Tahrirlangan matn:' kartasidan faqat toza matnni ajratadi (sarlavha +
+    ─── chiziqlar olib tashlanadi)."""
+    out: list[str] = []
+    for ln in (raw or "").split("\n"):
+        s = ln.strip()
+        if not s:
+            out.append("")
+            continue
+        if "Tahrirlangan matn" in s or "Tahrirlangan xat" in s:
+            continue
+        if set(s) <= set("─—-_=•· "):
+            continue
+        out.append(ln)
+    return "\n".join(out).strip()
+
+
+def _cache_share_text(text: str) -> str:
+    """Matnni inline ulashish uchun DB keshiga yozadi (sync sqlite3 — _build_keyboard
+    sync funksiya), token (id) qaytaradi. DB-backed → bot restart'da yo'qolmaydi."""
+    import sqlite3
+    with sqlite3.connect(config.DATABASE_PATH) as db:
+        cur = db.execute(
+            "INSERT INTO share_cache (content, created_at) VALUES (?, ?)",
+            ((text or "")[:4096], datetime.now(database.TZ).isoformat()))
+        token = cur.lastrowid
+        db.execute("DELETE FROM share_cache WHERE id < ?", (token - 500,))  # eskilarini tozalash
+        db.commit()
+    return str(token)
+
+
+def _build_keyboard(buttons: list, ids_by_type: dict[str, list[str]],
+                    share_text: str | None = None) -> InlineKeyboardMarkup | None:
+    """Convert Claude's button structure to aiogram InlineKeyboardMarkup.
+
+    Polish (intent B) javobida 'share' tugmasini IKKI xil ulashishga aylantiramiz:
+    📋 Nusxa (qo'lda, callback 'share') + 📤 Ulashish (inline, switch_inline_query).
+    Ortiqcha 'copy' (no-op) tugmasi tashlanadi — 📋 Nusxa uni qoplaydi."""
     if not buttons:
         return None
 
@@ -1247,6 +1354,15 @@ def _build_keyboard(buttons: list, ids_by_type: dict[str, list[str]]) -> InlineK
             callback = btn.get("callback", "")
             if not label or not callback:
                 continue
+            # Polish ulashish: 'share' → 📋 Nusxa + 📤 Ulashish (inline).
+            if callback == "share" and share_text:
+                kb_row.append(InlineKeyboardButton(text="📋 Nusxa", callback_data="share"))
+                token = _cache_share_text(_strip_polish_wrapper(share_text))
+                kb_row.append(InlineKeyboardButton(text="📤 Ulashish",
+                                                   switch_inline_query=f"txt:{token}"))
+                continue
+            if callback == "copy" and share_text:
+                continue  # no-op 'copy' tugmasi — 📋 Nusxa o'rnini bosadi
             resolved = _resolve_callback(callback, ids_by_type)
             if resolved is None:
                 continue
@@ -1300,6 +1416,11 @@ _BULK_DELETE_LABEL = {
 # shouldn't silently delete) — independent of the confirm_create_actions setting.
 _SINGLE_DELETE_ACTION_TYPES = {"delete_task", "cancel_meeting"}
 
+# Category-scoped destructive actions. ALWAYS confirm — delete_category clears a
+# label off many tasks; delete_tasks_by_category wipes them. Previewed with the
+# affected count (see _format_create_preview).
+_CATEGORY_DELETE_ACTION_TYPES = {"delete_category", "delete_tasks_by_category"}
+
 
 async def _maybe_refresh_section(
     message: Message,
@@ -1341,15 +1462,187 @@ async def _maybe_refresh_section(
         elif current == SectionFSM.in_meetings.state and created_meetings:
             await _render_meetings_for_filter(message, "week")
         elif current == SectionFSM.in_reminders.state and created_reminders:
-            await _render_reminders_for_filter(message, "upcoming")
+            await _render_reminders_for_filter(message, "active")
         elif current == SectionFSM.in_notes.state and created_notes:
             await _render_notes_for_filter(message, "inbox")
     except Exception:
         logger.exception("Section auto-refresh failed (non-fatal)")
 
 
+# ─────────────────── BO'SH SLOT (kalendar free-time) ───────────────────
+# "Seshanba bo'sh slotlarimni ko'rsat" / "bu hafta bo'sh vaqtim" — ish vaqtidan
+# (band = uchrashuvlar) bo'sh oraliqlarni hisoblab beradi.
+_FREE_WORK_START_H = 9     # ish kuni boshlanishi (09:00)
+_FREE_WORK_END_H = 18      # ish kuni tugashi (18:00)
+_MIN_FREE_SLOT_MIN = 30    # shundan kichik bo'shliqni ko'rsatmaymiz
+_DEFAULT_MEETING_MIN = 60  # datetime_end yo'q bo'lsa — taxminiy davomiylik
+
+_WEEKDAY_NAME_TO_IDX = {
+    "dushanba": 0, "seshanba": 1, "chorshanba": 2, "payshanba": 3,
+    "juma": 4, "shanba": 5, "yakshanba": 6,
+}
+
+
+def _resolve_target_date(s, now):
+    """ISO sana YOKI o'zbekcha hafta-kun / nisbiy so'zni date'ga aylantiradi.
+    Parse bo'lmasa None. (LLM sanani noto'g'ri yechsa ham — server fallback.)"""
+    if not s:
+        return None
+    s = str(s).strip().lower()
+    try:
+        return datetime.fromisoformat(s).date()
+    except (ValueError, TypeError):
+        pass
+    if s in ("bugun", "today"):
+        return now.date()
+    if s in ("ertaga", "tomorrow"):
+        return (now + timedelta(days=1)).date()
+    if s == "indin":
+        return (now + timedelta(days=2)).date()
+    if s in _WEEKDAY_NAME_TO_IDX:
+        # bugun shu kun bo'lsa — bugunni nazarda tutadi (kelasi hafta emas)
+        delta = (_WEEKDAY_NAME_TO_IDX[s] - now.weekday()) % 7
+        return (now + timedelta(days=delta)).date()
+    return None
+
+
+def _compute_free_slots(busy, window_start, window_end, min_minutes=_MIN_FREE_SLOT_MIN):
+    """SOF funksiya: band (start, end) oraliqlari va [window_start, window_end] ish
+    oynasidan — min_minutes dan katta bo'sh oraliqlarni (start, end) qaytaradi."""
+    clipped = []
+    for s, e in busy:
+        if e <= window_start or s >= window_end:
+            continue  # oyna tashqarisidagi uchrashuv — e'tiborsiz
+        clipped.append((max(s, window_start), min(e, window_end)))
+    clipped.sort(key=lambda x: x[0])
+    merged = []  # ustma-ust tushgan band oraliqlarni birlashtirish
+    for s, e in clipped:
+        if merged and s <= merged[-1][1]:
+            if e > merged[-1][1]:
+                merged[-1][1] = e
+        else:
+            merged.append([s, e])
+    free = []
+    cursor = window_start
+    gap = timedelta(minutes=min_minutes)
+    for s, e in merged:
+        if s - cursor >= gap:
+            free.append((cursor, s))
+        if e > cursor:
+            cursor = e
+    if window_end - cursor >= gap:
+        free.append((cursor, window_end))
+    return free
+
+
+def _fmt_dur(minutes):
+    """45 → '45 daq', 90 → '1s 30daq', 120 → '2 soat'."""
+    h, m = divmod(int(minutes), 60)
+    if h and m:
+        return f"{h}s {m}daq"
+    if h:
+        return f"{h} soat"
+    return f"{m} daq"
+
+
+async def _free_slots_for_day(target_date):
+    """Berilgan sana uchun (free_slots, busy_meetings) — ish vaqti ichida.
+    Bugun bo'lsa — o'tib ketgan vaqtni hisobga olmaydi (hozirdan boshlaydi)."""
+    # pytz: datetime(..., tzinfo=TZ) LMT (+04:37) beradi — TZ.localize() ishlatamiz
+    day_start = database.TZ.localize(datetime.combine(target_date, datetime.min.time()))
+    day_end = day_start + timedelta(days=1)
+    meetings = await database.list_meetings_in_window(
+        day_start.isoformat(), day_end.isoformat())
+    window_start = day_start.replace(hour=_FREE_WORK_START_H)
+    window_end = day_start.replace(hour=_FREE_WORK_END_H)
+    # Bugungi so'rovda — allaqachon o'tgan slotlarni ko'rsatmaymiz
+    now = datetime.now(database.TZ)
+    if target_date == now.date():
+        live = now.replace(second=0, microsecond=0)
+        live += timedelta(minutes=(5 - live.minute % 5) % 5)  # keyingi 5 daqiqaga yaxlitlash
+        if live > window_start:
+            window_start = min(live, window_end)
+    busy, busy_meetings = [], []
+    for m in meetings:
+        try:
+            s = datetime.fromisoformat(m["datetime_start"])
+        except (ValueError, TypeError, KeyError):
+            continue
+        end_raw = m.get("datetime_end")
+        try:
+            e = datetime.fromisoformat(end_raw) if end_raw else s + timedelta(minutes=_DEFAULT_MEETING_MIN)
+        except (ValueError, TypeError):
+            e = s + timedelta(minutes=_DEFAULT_MEETING_MIN)
+        if e <= s:
+            e = s + timedelta(minutes=_DEFAULT_MEETING_MIN)
+        busy.append((s, e))
+        # Ish oynasi bilan kesishadigan uchrashuvlarnigina "Band" ro'yxatida ko'rsatamiz
+        if e > window_start and s < window_end:
+            busy_meetings.append((s, e, m.get("title") or "Uchrashuv"))
+    free = _compute_free_slots(busy, window_start, window_end)
+    busy_meetings.sort(key=lambda x: x[0])
+    return free, busy_meetings
+
+
+def _format_free_day(target_date, free, busy_meetings):
+    """Bitta kunlik to'liq bo'sh-slot kartasi."""
+    weekday = UZ_WEEKDAYS_FULL[target_date.weekday()]
+    month = UZ_MONTHS_FULL[target_date.month - 1]
+    lines = [f"📅 **{weekday}, {target_date.day}-{month}** — bo'sh vaqt (09:00–18:00):", ""]
+    if not free:
+        lines.append("🔴 Ish vaqti to'liq band — bo'sh slot yo'q.")
+    else:
+        total = 0
+        for s, e in free:
+            mins = int((e - s).total_seconds() // 60)
+            total += mins
+            lines.append(f"🟢 {s.strftime('%H:%M')}–{e.strftime('%H:%M')}  ({_fmt_dur(mins)})")
+        lines.append("")
+        lines.append(f"_Jami bo'sh: {_fmt_dur(total)}_")
+    if busy_meetings:
+        lines.append("")
+        lines.append("⚪️ **Band:**")
+        for s, e, title in busy_meetings:
+            lines.append(f"   {s.strftime('%H:%M')}–{e.strftime('%H:%M')} — {title}")
+    return "\n".join(lines)
+
+
+def _format_free_week_line(target_date, free):
+    """Hafta ko'rinishidagi bitta kun — bir qatorli xulosa."""
+    weekday = UZ_WEEKDAYS_FULL[target_date.weekday()]
+    month = UZ_MONTHS_FULL[target_date.month - 1]
+    label = f"**{weekday}, {target_date.day}-{month}**"
+    if not free:
+        return f"🔴 {label}: to'la band"
+    total = sum(int((e - s).total_seconds() // 60) for s, e in free)
+    slots = ", ".join(f"{s.strftime('%H:%M')}–{e.strftime('%H:%M')}" for s, e in free)
+    return f"🟢 {label}: {_fmt_dur(total)} bo'sh — {slots}"
+
+
+async def _render_free_slots(message: Message, action: dict) -> None:
+    """show_free_slots action — kun yoki hafta bo'yicha bo'sh slotlarni chizadi."""
+    data = action.get("data") or {}
+    range_kind = (data.get("range") or "day").strip().lower()
+    now = datetime.now(database.TZ)
+    base = _resolve_target_date(data.get("date"), now)
+    if range_kind in ("week", "hafta"):
+        start = base or now.date()
+        monday = start - timedelta(days=start.weekday())  # shu hafta dushanbasi
+        lines = ["📅 **BU HAFTA — bo'sh vaqt** (09:00–18:00, ish kunlari)", ""]
+        for i in range(5):  # Dushanba–Juma
+            d = monday + timedelta(days=i)
+            free, _ = await _free_slots_for_day(d)
+            lines.append(_format_free_week_line(d, free))
+        await message.answer("\n".join(lines), parse_mode="Markdown")
+        return
+    target = base or now.date()
+    free, busy = await _free_slots_for_day(target)
+    await message.answer(_format_free_day(target, free, busy), parse_mode="Markdown")
+
+
 _SHOW_ACTION_TYPES = {
     "show_tasks", "show_meetings", "show_notes", "show_reminders", "show_contacts",
+    "show_free_slots",
 }
 
 
@@ -1374,6 +1667,8 @@ async def _render_show_action(message: Message, state: "FSMContext | None", acti
         await message.answer("🤝 **UCHRASHUVLAR**", parse_mode="Markdown",
                              reply_markup=meetings_section_reply_keyboard())
         await _render_meetings_for_filter(message, filt or "week")
+    elif atype == "show_free_slots":
+        await _render_free_slots(message, action)
     elif atype == "show_notes":
         await cmd_notes(message, state)
     elif atype == "show_reminders":
@@ -1426,6 +1721,26 @@ async def _format_create_preview(actions: list[dict]) -> str:
                 task = None
             title = (task or {}).get("title") or (d.get("title") or a.get("id", "—"))
             lines.append(f"✏️ **Yangilanadi:** {title}")
+            lines.append("")
+            continue
+        if t == "delete_category":
+            cat = (d.get("category") or "—").strip()
+            try:
+                n = await database.count_tasks_in_category(cat)
+            except Exception:
+                n = 0
+            lines.append(f"🗑 **«{cat}» kategoriyasi o'chiriladi**")
+            lines.append(f"   _{n} ta vazifaning yorlig'i olinadi — vazifalar saqlanadi ((boshqa)ga o'tadi)._")
+            lines.append("")
+            continue
+        if t == "delete_tasks_by_category":
+            cat = (d.get("category") or "—").strip()
+            try:
+                n = await database.count_tasks_in_category(cat)
+            except Exception:
+                n = 0
+            lines.append(f"🧹 **«{cat}» kategoriyasidagi {n} ta vazifa o'chiriladi**")
+            lines.append("   _Qaytarib bo'lmaydi._")
             lines.append("")
             continue
         if t == "delete_task":
@@ -1575,16 +1890,19 @@ async def _process_and_reply(message: Message, user_text: str, state: "FSMContex
             await database.complete_pending_action(pending_id)
             return
 
-        # ── Export intent ("vazifalarni eksport qil" / "excel qilib ber") ──
-        # Send the .xlsx file, same as /export — works from voice and text.
-        if any(a.get("type") == "export_tasks" for a in final_response.get("actions", [])):
+        # ── Export intent ("vazifalarni eksport qil" / "X vazifalarini eksport qil") ──
+        # Send the .xlsx file, same as /export — works from voice and text. An
+        # optional data.assignee narrows it to one executor.
+        _exp = next((a for a in final_response.get("actions", []) if a.get("type") == "export_tasks"), None)
+        if _exp is not None:
             await database.complete_pending_action(pending_id)
             if progress_msg is not None:
                 try:
                     await progress_msg.delete()
                 except TelegramBadRequest:
                     pass
-            await _send_tasks_export(message)
+            _exp_who = ((_exp.get("data") or {}).get("assignee") or "").strip() or None
+            await _send_tasks_export(message, assignee=_exp_who)
             return
 
         # ── "Ko'rsat/ro'yxat" intent — render the REAL section from the DB ──
@@ -1636,9 +1954,10 @@ async def _process_and_reply(message: Message, user_text: str, state: "FSMContex
             _settings = {}
         bulk_deletes = [a for a in actions if a.get("type") in _BULK_DELETE_ACTION_TYPES]
         single_deletes = [a for a in actions if a.get("type") in _SINGLE_DELETE_ACTION_TYPES]
+        cat_deletes = [a for a in actions if a.get("type") in _CATEGORY_DELETE_ACTION_TYPES]
         # Deletes ALWAYS confirm (irreversible). Creates confirm only if the
         # confirm_create_actions setting is on.
-        to_confirm = list(bulk_deletes) + list(single_deletes)
+        to_confirm = list(bulk_deletes) + list(single_deletes) + list(cat_deletes)
         if _settings.get("confirm_create_actions", True):
             to_confirm += [a for a in actions if a.get("type") in _DESTRUCTIVE_ACTION_TYPES]
         if state is not None and to_confirm:
@@ -1674,7 +1993,8 @@ async def _process_and_reply(message: Message, user_text: str, state: "FSMContex
                 return
 
         ids_by_type = await _execute_actions(actions)
-        keyboard = _build_keyboard(final_response.get("buttons", []), ids_by_type)
+        keyboard = _build_keyboard(final_response.get("buttons", []), ids_by_type,
+                                   share_text=final_response.get("user_message"))
         if keyboard:
             keyboard = _append_back_row(keyboard)
 
@@ -1714,11 +2034,24 @@ async def _process_and_reply(message: Message, user_text: str, state: "FSMContex
 async def cmd_start(message: Message, state: FSMContext) -> None:
     # /start is the universal "I'm confused, reset" command — clear any FSM
     # state so a user stuck mid-flow can recover without finding a Back button.
+    # It also serves as onboarding: a concise tour of what the bot does + examples.
     await state.clear()
     await message.answer(
-        "**Yordamchi tayyor** 🤝\n\n"
-        "Matn yoki ovoz orqali topshiriq yuborishingiz mumkin.\n"
-        "Pastdagi tugmalardan foydalanib tezda harakat qiling.",
+        "🤝 **Yordamchi — shaxsiy AI yordamchingiz**\n\n"
+        "Vazifa, eslatma, uchrashuv va qaydlaringizni boshqaraman. "
+        "Oddiy til yoki ovoz bilan yozing — qolganini o'zim bajaraman.\n\n"
+        "**Imkoniyatlar:**\n"
+        "📌 Vazifalar — muddat · ijrochi · ustuvorlik · kategoriya\n"
+        "⏰ Eslatmalar — vaqtli ping (bir martalik yoki takroriy)\n"
+        "🤝 Uchrashuvlar — kalendar · tayyorgarlik · bayonnoma\n"
+        "📝 Qaydlar — tez fikr ilib olish (GTD inbox)\n"
+        "👥 Ijrochilar · 🚨 Risklar · 📊 Statistika · 🎛 Cockpit\n\n"
+        "**Shunchaki yozing yoki ayting:**\n"
+        "• _«Ertaga 15:00 da Aziz bilan uchrashuv»_\n"
+        "• _«Juma kuni hisobotni topshirish — muhim»_\n"
+        "• _«30 daqiqadan keyin dori ichishni eslat»_\n\n"
+        "🎙 Ovozli xabar ham yuboring — avtomatik tushunaman.\n"
+        "Buyruqlar: /help  ·  Boshqaruv paneli: /cockpit",
         parse_mode="Markdown",
         reply_markup=main_reply_keyboard(),
     )
@@ -1801,11 +2134,10 @@ async def cmd_backup(message: Message) -> None:
     )
 
 
-@router.message(Command("delegations"))
-async def cmd_delegations(message: Message) -> None:
-    """Delegation tracker — show tasks assigned to others, sorted by how
-    long they've been pending. Surfaces "stuck" delegations before they
-    become problems."""
+async def _render_stale_delegations(message: Message) -> None:
+    """Ijrochilar panelining sub-ko'rinishi (eski "Delegatsiya trekeri" shu yerga
+    ko'chirildi): boshqalarga berilgan aktiv vazifalarni eng uzoq kutilgani
+    bo'yicha ko'rsatadi — qotib qolgan topshiriqlarni yuzaga chiqaradi."""
     import aiosqlite
     async with aiosqlite.connect(config.DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -1824,11 +2156,11 @@ async def cmd_delegations(message: Message) -> None:
         rows = [dict(r) for r in await cur.fetchall()]
 
     if not rows:
+        # team reply-klaviaturani saqlaymiz (reply_markup bermaymiz)
         await _safe_answer(
             message,
-            "👥  **DELEGATSIYALAR**\n\n_Boshqa kishilarga berilgan aktiv vazifa yo'q._",
+            "⏳  **KUTILAYOTGAN TOPSHIRIQLAR**\n\n_Boshqalarga berilgan aktiv vazifa yo'q._",
             parse_mode="Markdown",
-            reply_markup=single_back_keyboard(),
         )
         return
 
@@ -1837,7 +2169,9 @@ async def cmd_delegations(message: Message) -> None:
     # stuck delegation is the thing this view exists to surface.
     DIVIDER = "━" * 20
     shown = rows[:12]
-    lines = ["👥  **DELEGATSIYALAR**", "", f"Natija · {len(rows)} ta", "", DIVIDER, ""]
+    lines = ["⏳  **KUTILAYOTGAN TOPSHIRIQLAR**", "",
+             f"_Boshqalarga berilgan · eng uzoq kutilgani birinchi · {len(rows)} ta_",
+             "", DIVIDER, ""]
     for i, t in enumerate(shown, 1):
         age = int(t.get("age_days") or 0)
         badge = "🔴" if age >= 7 else "🟠" if age >= 3 else "🟡" if age >= 1 else "⚪"
@@ -1873,7 +2207,7 @@ async def cmd_delegations(message: Message) -> None:
 
 # Shared column schema for export & import. "№" is a row-number column (ignored
 # on import — matched by name). Headers are lowercased when read back.
-_EXPORT_HEADERS = ["№", "Vazifa", "Ijrochi", "Muddat", "Ustuvorlik", "Holat", "Izoh"]
+_EXPORT_HEADERS = ["№", "Vazifa", "Ijrochi", "Muddat", "Ustuvorlik", "Holat", "Izoh", "Kategoriya"]
 
 
 def _export_date(iso):
@@ -1931,13 +2265,25 @@ def _import_status(val) -> str:
 
 @router.message(Command("export"))
 async def cmd_export(message: Message) -> None:
-    """Export tasks to an .xlsx. Also reachable by voice/text ('eksport qil')."""
-    await _send_tasks_export(message)
+    """Export tasks to an .xlsx. `/export <ism>` filters by assignee. Also reachable
+    by voice/text ('eksport qil' / 'X vazifalarini eksport qil')."""
+    parts = (message.text or "").split(maxsplit=1)
+    assignee = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+    await _send_tasks_export(message, assignee=assignee)
 
 
-async def _send_tasks_export(message: Message) -> None:
-    """Build and send the tasks workbook (Template style). Shared by /export and
-    the export_tasks action (voice/text 'vazifalarni eksport qil')."""
+@router.callback_query(F.data.startswith("exportby:"))
+async def cb_export_by(query: CallbackQuery) -> None:
+    """Quick per-assignee export (button under the full export)."""
+    assignee = query.data.split(":", 1)[1]
+    await query.answer(f"📤 {assignee}…")
+    await _send_tasks_export(query.message, assignee=assignee)
+
+
+async def _send_tasks_export(message: Message, assignee: str | None = None) -> None:
+    """Build and send the tasks workbook (Template style). Shared by /export, the
+    export_tasks action (voice/text), and the per-assignee buttons. `assignee`
+    filters to one executor's tasks."""
     import io
     from aiogram.types import BufferedInputFile
     try:
@@ -1949,23 +2295,29 @@ async def _send_tasks_export(message: Message) -> None:
         return
 
     tasks = await database.list_tasks(limit=10000)  # all statuses
+    if assignee:
+        al = assignee.strip().lower()
+        tasks = [t for t in tasks if (t.get("assignee") or "").strip().lower() == al]
     if not tasks:
-        await message.answer("📭 Eksport qilish uchun vazifa yo'q.")
+        await message.answer(f"📭 «{assignee}» bo'yicha vazifa topilmadi." if assignee
+                             else "📭 Eksport qilish uchun vazifa yo'q.")
         return
 
     # ── Template style: clean document look — bold black title/header, hair-line
-    #    borders, no fills (only the subtitle is shaded), a № column, real dates. ──
+    #    borders, no fills (only the subtitle is shaded), a № column, real dates.
+    #    Visible cols: №..Kategoriya; ID is the last, hidden column (round-trip). ──
     ARIAL = "Arial"
     SUB = "F2F2F2"
     hair = Side(style="hair")
     grid = Border(left=hair, right=hair, top=hair, bottom=hair)
-    last_col = get_column_letter(len(_EXPORT_HEADERS))  # 7 cols (№ + 6) → "G"
+    n_visible = len(_EXPORT_HEADERS)            # 8 visible (№ … Kategoriya)
+    id_col = n_visible + 1                       # 9 — hidden ID
+    last_col = get_column_letter(n_visible)      # "H"
 
     wb = Workbook()
     ws = wb.active
     ws.title = "Vazifalar"
 
-    # Row 1 — title (merged B1:G1, centered, bold, no fill — № column stays clear)
     ws.merge_cells(f"B1:{last_col}1")
     t1 = ws["B1"]
     t1.value = "VAZIFALAR RO'YXATI"
@@ -1973,25 +2325,26 @@ async def _send_tasks_export(message: Message) -> None:
     t1.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 30
 
-    # Row 2 — subtitle (merged B2:G2, light gray, left)
     ws.merge_cells(f"B2:{last_col}2")
     t2 = ws["B2"]
     now_s = datetime.now(database.TZ).strftime("%d-%m-%Y %H:%M")
-    t2.value = f"Yaratilgan: {now_s}      Jami: {len(tasks)} ta vazifa"
+    sub = f"Yaratilgan: {now_s}      Jami: {len(tasks)} ta vazifa"
+    if assignee:
+        sub += f"      ·  Ijrochi: {assignee}"
+    t2.value = sub
     t2.font = Font(name=ARIAL, size=11, color="404040")
     t2.fill = PatternFill("solid", fgColor=SUB)
     t2.alignment = Alignment(horizontal="left", vertical="center", indent=1)
     ws.row_dimensions[2].height = 20
 
-    # Row 3 — header (Arial 14 bold, centered, hair borders, no fill)
     for i, h in enumerate(_EXPORT_HEADERS, 1):
         c = ws.cell(row=3, column=i, value=h)
         c.font = Font(name=ARIAL, size=14, bold=True, color="000000")
         c.alignment = Alignment(horizontal="center", vertical="center")
         c.border = grid
+    ws.cell(row=3, column=id_col, value="ID").font = Font(name=ARIAL, size=11, bold=True, color="808080")
     ws.row_dimensions[3].height = 38
 
-    # Rows 4+ — data (Arial 13; № + 6 fields; Muddat a real date, no time)
     for n, t in enumerate(tasks, start=1):
         r = n + 3
         cells = [
@@ -2002,6 +2355,7 @@ async def _send_tasks_export(message: Message) -> None:
             _PRIORITY_LABEL_UZ.get(t.get("priority", "P2"), "Rejadagi"),
             _STATUS_LABEL_UZ.get(t.get("status", "todo"), t.get("status", "")),
             (t.get("description") or "").strip(),
+            (t.get("category") or "").strip(),
         ]
         for i, val in enumerate(cells, 1):
             c = ws.cell(row=r, column=i, value=val)
@@ -2014,29 +2368,40 @@ async def _send_tasks_export(message: Message) -> None:
             )
             if i == 4 and val is not None:
                 c.number_format = "DD-MM-YYYY"  # date only — no clock
-        # Hidden ID (col H) — lets a re-imported export UPDATE the task instead
-        # of creating a duplicate. Invisible in Excel; matched by name on import.
-        idc = ws.cell(row=r, column=8, value=t.get("id"))
+        idc = ws.cell(row=r, column=id_col, value=t.get("id"))
         idc.font = Font(name=ARIAL, size=11, color="808080")
         idc.border = grid
         ws.row_dimensions[r].height = 45
 
-    ws.cell(row=3, column=8, value="ID").font = Font(name=ARIAL, size=11, bold=True, color="808080")
-    for col, w in zip("ABCDEFG", [8.8, 61.8, 33.2, 31.5, 28.5, 23.3, 58.0]):
+    for col, w in zip("ABCDEFGH", [8.8, 61.8, 33.2, 31.5, 28.5, 23.3, 58.0, 22.0]):
         ws.column_dimensions[col].width = w
-    ws.column_dimensions["H"].hidden = True  # ID column — present for round-trip, hidden
+    ws.column_dimensions[get_column_letter(id_col)].hidden = True  # ID — round-trip, hidden
     ws.freeze_panes = "A4"  # title + subtitle + header stay visible while scrolling
 
     buf = io.BytesIO()
     wb.save(buf)
-    fname = f"vazifalar_{datetime.now(database.TZ).strftime('%Y-%m-%d')}.xlsx"
+    tag = (assignee or "hammasi").strip().replace(" ", "_").replace("/", "-")
+    fname = f"vazifalar_{tag}_{datetime.now(database.TZ).strftime('%Y-%m-%d')}.xlsx"
+    cap = f"📤 **{len(tasks)} ta vazifa** eksport qilindi"
+    cap += f" — _{assignee}_." if assignee else "."
+    cap += "\n\n_Tahrirlab qaytadan yuborsangiz — import bo'ladi (tasdiqdan keyin)._"
     await message.answer_document(
-        BufferedInputFile(buf.getvalue(), filename=fname),
-        caption=(f"📤 **{len(tasks)} ta vazifa** eksport qilindi.\n\n"
-                 "_Faylni tahrirlab yoki qator qo'shib qaytadan yuborsangiz — "
-                 "import bo'ladi (tasdiqdan keyin)._"),
-        parse_mode="Markdown",
+        BufferedInputFile(buf.getvalue(), filename=fname), caption=cap, parse_mode="Markdown",
     )
+
+    # When exporting everything, offer quick per-assignee export buttons.
+    if not assignee:
+        names = sorted({(t.get("assignee") or "").strip() for t in tasks if (t.get("assignee") or "").strip()})
+        if names:
+            kb_rows, row = [], []
+            for nm in names[:8]:
+                row.append(InlineKeyboardButton(text=f"👤 {nm}", callback_data=f"exportby:{nm}"[:64]))
+                if len(row) == 2:
+                    kb_rows.append(row); row = []
+            if row:
+                kb_rows.append(row)
+            await message.answer("Yoki ijrochi bo'yicha eksport:",
+                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 
 def _norm_header(c) -> str:
@@ -2055,6 +2420,7 @@ _COL_DEADLINE = ("muddat", "muddati", "sana", "tugatishsanasi", "tugashsanasi", 
 _COL_PRIORITY = ("ustuvorlik", "muhimlik", "daraja", "darajasi", "priority")
 _COL_STATUS = ("holat", "holati", "status")
 _COL_DESC = ("izoh", "izohi", "tavsif", "tavsifi", "qoshimcha", "description")
+_COL_CATEGORY = ("kategoriya", "category", "turkum", "bolim")
 
 
 def _structured_tasks_from_table(table: list) -> list[dict]:
@@ -2095,6 +2461,9 @@ def _structured_tasks_from_table(table: list) -> list[dict]:
         # Never let the assignee leak into the description (reported field-mix bug).
         if desc and not (asg and desc.strip().lower() == asg.strip().lower()):
             data["description"] = desc
+        cat = str(pick(d, _COL_CATEGORY) or "").strip()
+        if cat and cat != "(boshqa)":
+            data["category"] = cat
         # Carry the optional ID (hidden export column) so the caller can turn this
         # into an UPDATE when the task still exists — instead of a duplicate.
         out.append({"type": "create_task", "data": data, "_id": str(pick(d, ("id",)) or "").strip()})
@@ -2177,20 +2546,304 @@ async def _smart_tasks_from_table(table: list) -> list[dict]:
     return out
 
 
-def _is_task_import_doc(message: Message) -> bool:
-    """True for .xlsx/.csv/.pdf documents — routes them to the importer. Registered
-    BEFORE the generic 'unsupported attachment' handler so it wins for these."""
-    doc = message.document
-    return bool(doc and (doc.file_name or "").lower().endswith((".xlsx", ".csv", ".pdf")))
+_IMPORT_PAGE_SIZE = 10
 
 
-@router.message(_is_task_import_doc)
-async def handle_task_import(message: Message, state: FSMContext) -> None:
-    """Parse an uploaded .xlsx/.csv of tasks → preview → confirm → create.
-    Reuses the standard acts_confirm pipeline so nothing is created silently."""
-    import io
+def _import_deadline_label(iso) -> str:
+    """Short deadline for the import preview: 'DD-MM, HH:MM' or 'Deadline yo'q'."""
+    if not iso:
+        return "Deadline yo'q"
+    try:
+        return datetime.fromisoformat(iso).astimezone(database.TZ).strftime("%d-%m, %H:%M")
+    except (ValueError, TypeError):
+        return str(iso)
+
+
+def _format_import_page(actions: list[dict], page: int) -> str:
+    """One paginated page of the import preview. Each record is a clean 3-line
+    block (title / 👤 ijrochi / ⏳ muddat) so long titles never mangle the layout."""
+    total = len(actions)
+    pages = max(1, (total + _IMPORT_PAGE_SIZE - 1) // _IMPORT_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    start = page * _IMPORT_PAGE_SIZE
+    chunk = actions[start:start + _IMPORT_PAGE_SIZE]
+    lines = ["⚠️ **TASDIQLAYSIZMI?**", "", f"📋 {total} ta yozuv topildi"]
+    if pages > 1:
+        lines.append(f"_Ko'rsatilmoqda: {start + 1}–{start + len(chunk)} / {total}_")
+    lines.append("")
+    for i, a in enumerate(chunk, start=start + 1):
+        d = a.get("data", {}) or {}
+        title = (d.get("title") or "—").strip()
+        assignee = (d.get("assignee") or "belgilanmagan").strip() or "belgilanmagan"
+        upd = " ✏️" if a.get("type") == "update_task" else ""
+        lines.append(f"**{i}. {title}**{upd}")
+        lines.append(f"   👤 {assignee}")
+        lines.append(f"   ⏳ {_import_deadline_label(d.get('deadline'))}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _import_preview_keyboard(page: int, total_pages: int, switch_uid: str = "") -> InlineKeyboardMarkup:
+    rows = []
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=f"imppage:{page - 1}"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="Keyingi ➡️", callback_data=f"imppage:{page + 1}"))
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="✅ Hammasini import qilish", callback_data="acts_confirm")])
+    if switch_uid:  # one-tap switch to analysis (when default guessed "import")
+        rows.append([InlineKeyboardButton(text="📄 Tahlil qil", callback_data=f"docact:analyze:{switch_uid}")])
+    rows.append([InlineKeyboardButton(text="❌ Bekor qilish", callback_data="acts_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("imppage:"))
+async def cb_import_page(query: CallbackQuery, state: FSMContext) -> None:
+    """Flip import-preview pages without re-parsing — actions live in FSM state."""
+    try:
+        page = int(query.data.split(":", 1)[1])
+    except ValueError:
+        return
+    data = await state.get_data()
+    actions = (data.get("pending_response") or {}).get("actions") or []
+    if not actions:
+        await query.answer("Vaqt o'tdi — faylni qayta yuboring.", show_alert=True)
+        return
+    await query.answer()
+    switch_uid = data.get("_doc_uid") or ""
+    total_pages = max(1, (len(actions) + _IMPORT_PAGE_SIZE - 1) // _IMPORT_PAGE_SIZE)
+    try:
+        await query.message.edit_text(
+            _format_import_page(actions, page), parse_mode="Markdown",
+            reply_markup=_import_preview_keyboard(page, total_pages, switch_uid),
+        )
+    except TelegramBadRequest:
+        pass
+
+
+# Importable document kinds — the task importer can parse these into a table.
+_IMPORTABLE_KINDS = {"excel", "csv", "pdf"}
+# Caption keywords that mean "load this as a task LIST" (→ importer). Kept
+# deliberately narrow; any other caption is treated as an analysis instruction
+# (Claude can still extract tasks from prose via proposed actions).
+_IMPORT_CAPTION_HINTS = ("import", "yukla", "jadval", "ro'yxatni", "royxatni", "ro'yxat qil")
+# Caption keywords that mean "just file this for later" (→ notes inbox).
+_NOTE_CAPTION_HINTS = ("qayd", "saqlab qo'y", "saqlab qoy", "inbox", "keyinroq")
+
+# file_unique_id -> {"file_id", "name", "kind", "mime"}. Lets an inline button
+# (the caption-less-PDF ask prompt, or a result's switch button) re-fetch a
+# just-seen file without stuffing the long file_id into 64-byte callback_data.
+# Single-user bot → tiny, short-lived; bounded below.
+_DOC_FLIP_CACHE: "dict[str, dict]" = {}
+_DOC_FLIP_CACHE_MAX = 20
+
+
+def _doc_remember(file_unique_id: str, file_id: str, name: str, kind: str, mime: str = "") -> None:
+    if not file_unique_id or not file_id:
+        return
+    if len(_DOC_FLIP_CACHE) >= _DOC_FLIP_CACHE_MAX:
+        try:  # drop the oldest entry (dict preserves insertion order)
+            _DOC_FLIP_CACHE.pop(next(iter(_DOC_FLIP_CACHE)))
+        except StopIteration:
+            pass
+    _DOC_FLIP_CACHE[file_unique_id] = {"file_id": file_id, "name": name, "kind": kind, "mime": mime}
+
+
+def _decide_file_route(caption: str, kind: str) -> str:
+    """Decide what to do with an incoming file: 'import', 'analyze', or 'note'.
+    Pure function (no I/O) so the disambiguation rule stays unit-tested.
+
+    Rule — caption + smart default:
+      • caption says note            → note
+      • caption says import (and the kind is importable) → import
+      • any other caption            → analyze (the caption is the instruction)
+      • no caption: excel/csv        → import
+      • no caption: everything else  → analyze
+    """
+    cap = (caption or "").strip().lower()
+    if cap:
+        if any(h in cap for h in _NOTE_CAPTION_HINTS):
+            return "note"
+        if any(h in cap for h in _IMPORT_CAPTION_HINTS) and kind in _IMPORTABLE_KINDS:
+            return "import"
+        return "analyze"
+    if kind in ("excel", "csv"):
+        return "import"
+    return "analyze"
+
+
+@router.message(F.document | F.photo)
+async def handle_incoming_file(message: Message, state: FSMContext) -> None:
+    """Single entry point for uploaded/forwarded documents and photos. Routes by
+    caption + file type (see _decide_file_route): a task LIST is imported, a
+    document/image is analysed by Claude, an explicit 'qayd' caption files it to
+    the notes inbox. Registered before the generic 'unsupported attachment'
+    handler so it wins for documents and photos."""
     doc = message.document
-    name = (doc.file_name or "").lower()
+    photo = message.photo[-1] if message.photo else None
+    caption = (message.caption or "").strip()
+
+    if doc is not None:
+        file_name = doc.file_name or ""
+        mime = doc.mime_type or ""
+        kind = document_service.detect_kind(file_name, mime)
+        file_id, file_unique_id = doc.file_id, doc.file_unique_id
+    elif photo is not None:
+        file_name, mime, kind = "photo.jpg", "image/jpeg", "image"
+        file_id, file_unique_id = photo.file_id, photo.file_unique_id
+    else:
+        return  # neither — shouldn't happen given the filter
+
+    # Cache the file so any inline button (ask prompt / switch) can re-fetch it.
+    _doc_remember(file_unique_id, file_id, file_name, kind, mime)
+
+    route = _decide_file_route(caption, kind)
+    label = file_name or ("rasm" if photo else "fayl")
+    is_fwd = bool(getattr(message, "forward_origin", None) or getattr(message, "forward_from", None))
+
+    if route == "note":
+        await _capture_file_as_note(message, label=label, caption=caption, is_fwd=is_fwd)
+    elif route == "import":
+        await _run_task_import(message, state)
+    elif kind == "pdf" and not caption:
+        # PDF is the one genuinely ambiguous type (contract vs exported task
+        # list) and analysis is the expensive path — ask before guessing.
+        await _ask_file_intent(message, file_unique_id, label)
+    else:
+        await _analyze_document(
+            message, state, instruction=caption,
+            file_id=file_id, file_unique_id=file_unique_id,
+            file_name=file_name, mime=mime, kind=kind,
+        )
+
+
+async def _capture_file_as_note(message: Message, *, label: str, caption: str = "",
+                                is_fwd: bool = False) -> None:
+    """File an attachment to the notes inbox. Stores the caption (+ the file
+    name) — not the binary; just the intent to revisit. Reused by the 'Qaydga
+    saqla' switch button (docact:note) and the 'qayd' caption route."""
+    try:
+        nid = await database.create_note({
+            "content": caption or f"Yuborilgan fayl: {label}",
+            "title": f"📎 {label}",
+            "tags": ["fayl"],
+            "source": "forward" if is_fwd else "manual",
+        })
+    except Exception as e:
+        await message.answer(_humanize_error(e))
+        return
+    await message.answer(f"📝 Inbox'ga saqlandi: {label}\n/notes — qaydlar" if nid
+                         else "📝 Saqlab bo'lmadi.")
+
+
+async def _analyze_document(
+    message: Message, state: FSMContext, *, instruction: str,
+    file_id: str, file_unique_id: str, file_name: str, mime: str, kind: str,
+) -> None:
+    """Download → extract → Claude multimodal analysis → summary, plus any
+    proposed tasks routed through the standard acts_confirm confirm pipeline."""
+    try:
+        file = await message.bot.get_file(file_id)
+        blob = await message.bot.download_file(file.file_path)
+        data = blob.read() if hasattr(blob, "read") else blob
+    except Exception as e:
+        await message.answer(_humanize_error(e))
+        return
+
+    try:
+        blocks, meta = document_service.build_content_blocks(data, kind, file_name, mime)
+    except document_service.DocumentError as e:
+        await message.answer(f"📄 {e}")
+        return
+    except Exception as e:
+        logger.exception("Document block build failed")
+        await message.answer(_humanize_error(e))
+        return
+
+    if instruction.strip():
+        directive = (
+            f"Foydalanuvchi shu fayl bilan so'radi: «{instruction.strip()}». Shuni bajar. "
+            "Aniq muddat yoki majburiyat bo'lsa, create_task/create_reminder action taklif qil."
+        )
+    else:
+        directive = (
+            "Bu hujjatni executive uchun tahlil qil: qisqacha xulosa, muhim sanalar/muddatlar, "
+            "majburiyatlar, summalar va tomonlar, hamda e'tibor talab qiladigan nuqtalar. Aniq "
+            "muddat/majburiyat bo'lsa, create_task yoki create_reminder action sifatida taklif qil."
+        )
+
+    typing_task = asyncio.create_task(_keep_typing(message.bot, message.chat.id))
+    working = await message.answer("🔍 Hujjatni o'qiyapman…")
+    try:
+        response = await claude_service.process_document(
+            directive, blocks, file_label=file_name or kind)
+    except Exception as e:
+        logger.exception("process_document failed")
+        try:
+            await working.edit_text(_humanize_error(e))
+        except TelegramBadRequest:
+            await message.answer(_humanize_error(e))
+        return
+    finally:
+        typing_task.cancel()
+
+    try:
+        await working.delete()
+    except TelegramBadRequest:
+        pass
+
+    summary = (response.get("user_message") or "").strip() or "📄 Hujjat o'qildi."
+    if meta.get("truncated"):
+        summary += "\n\n_(Hujjat uzun — boshlang'ich qismi tahlil qilindi.)_"
+
+    # Proposed commitments — already listed in the summary's "➡️ Taklif" lines by
+    # Claude; the action bar below acts on them.
+    actions = [a for a in response.get("actions", [])
+               if a.get("type") in _DESTRUCTIVE_ACTION_TYPES][:_MAX_CREATE_ACTIONS_PER_MSG]
+
+    # Unified action bar — reuses the bot's existing concepts so it never drifts
+    # from the rest of the UI: acts_confirm / acts_cancel (create / cancel), the
+    # notes inbox (capture), and a revise-by-instruction flow (like polish "✏️ Tahrirla").
+    rows = []
+    if actions:
+        try:
+            prior_state = await state.get_state()
+        except Exception:
+            prior_state = None
+        await state.set_state(CreateActionConfirmFSM.awaiting)
+        await state.update_data(
+            pending_response={"actions": actions,
+                              "user_message": "✅ Hujjatdan vazifa(lar) qo'shildi.", "buttons": []},
+            _prior_section=prior_state,
+        )
+        rows.append([
+            InlineKeyboardButton(text="✅ Vazifa yarat", callback_data="acts_confirm"),
+            InlineKeyboardButton(text="✏️ Tahrirla", callback_data=f"docedit:{file_unique_id}"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="📝 Qaydga saqla", callback_data=f"docact:note:{file_unique_id}"),
+            InlineKeyboardButton(text="✕ Bekor qil", callback_data="acts_cancel"),
+        ])
+    else:
+        # Pure summary — nothing to create; offer revise + capture.
+        rows.append([
+            InlineKeyboardButton(text="✏️ Tahrirla", callback_data=f"docedit:{file_unique_id}"),
+            InlineKeyboardButton(text="📝 Qaydga saqla", callback_data=f"docact:note:{file_unique_id}"),
+        ])
+    await _safe_answer(message, summary, parse_mode="Markdown",
+                       reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+async def _run_task_import(message: Message, state: FSMContext) -> None:
+    """Download an uploaded .xlsx/.csv/.pdf and import its tasks. Thin wrapper —
+    parsing + preview + confirm lives in _import_tasks_from_file_bytes so the
+    PDF→import flip button can reuse it."""
+    doc = message.document
+    if doc is None:
+        await message.answer("📄 Import uchun Excel (.xlsx), CSV yoki PDF fayl yuboring.")
+        return
     try:
         file = await message.bot.get_file(doc.file_id)
         blob = await message.bot.download_file(file.file_path)
@@ -2198,6 +2851,18 @@ async def handle_task_import(message: Message, state: FSMContext) -> None:
     except Exception as e:
         await message.answer(_humanize_error(e))
         return
+    await _import_tasks_from_file_bytes(message, state, data, doc.file_name or "",
+                                        switch_uid=doc.file_unique_id)
+
+
+async def _import_tasks_from_file_bytes(
+    message: Message, state: FSMContext, data: bytes, name: str, switch_uid: str = ""
+) -> None:
+    """Parse a task table from raw bytes → preview → confirm → create. Reuses the
+    standard acts_confirm pipeline so nothing is created silently. switch_uid (a
+    cached file id) adds a one-tap '📄 Tahlil qil' switch under the preview."""
+    import io
+    name = (name or "").lower()
 
     # ── Read the file into a raw table (list of row tuples) ──
     try:
@@ -2206,7 +2871,15 @@ async def handle_task_import(message: Message, state: FSMContext) -> None:
             table = [tuple(r) for r in csv.reader(io.StringIO(data.decode("utf-8-sig", errors="replace")))
                      if any((c or "").strip() for c in r)]
         elif name.endswith(".pdf"):
-            from pypdf import PdfReader
+            try:
+                from pypdf import PdfReader
+            except ImportError:
+                await message.answer(
+                    "📄 PDF importi bu yerda hali sozlanmagan. Excel (.xlsx) yoki CSV "
+                    "yuboring.\n_(Server: `pip install -r requirements.txt`)_",
+                    parse_mode="Markdown",
+                )
+                return
             reader = PdfReader(io.BytesIO(data))
             text = "\n".join((p.extract_text() or "") for p in reader.pages)
             # PDFs have no columns → each text line becomes a row; the smart
@@ -2229,7 +2902,6 @@ async def handle_task_import(message: Message, state: FSMContext) -> None:
     #    Stage 2: if none, Claude reads the raw content and finds tasks in ANY
     #    layout (different headers, free text, mixed). ──
     actions = _structured_tasks_from_table(table)
-    method = "ustunlar bo'yicha"
     # Round-trip dedup: a row whose ID (hidden export column) still exists becomes
     # an UPDATE — so editing the exported file and re-sending it changes the task
     # instead of creating a duplicate. Unknown/blank ID → a new task.
@@ -2241,7 +2913,6 @@ async def handle_task_import(message: Message, state: FSMContext) -> None:
     if not actions:
         thinking = await message.answer("🔍 Fayldan vazifalarni topyapman…")
         actions = await _smart_tasks_from_table(table)
-        method = "aqlli tahlil"
         try:
             await thinking.delete()
         except TelegramBadRequest:
@@ -2273,11 +2944,6 @@ async def handle_task_import(message: Message, state: FSMContext) -> None:
         overflow = (f"\n\n⚠️ Bir importda {_MAX_CREATE_ACTIONS_PER_MSG} tagacha. "
                     f"Qolgan {dropped} tasini alohida fayl bilan yuboring.")
 
-    preview = f"📥 **IMPORT** ({method}) — {len(actions)} ta vazifa\n\n" + await _format_create_preview(actions) + overflow
-    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Import qilaman", callback_data="acts_confirm"),
-        InlineKeyboardButton(text="✕ Bekor", callback_data="acts_cancel"),
-    ]])
     n_upd = sum(1 for a in actions if a.get("type") == "update_task")
     n_new = len(actions) - n_upd
     done_msg = "📥 Import: " + f"{n_new} yangi" + (f", {n_upd} yangilangan" if n_upd else "") + " vazifa."
@@ -2285,8 +2951,117 @@ async def handle_task_import(message: Message, state: FSMContext) -> None:
     await state.update_data(
         pending_response={"actions": actions, "user_message": done_msg, "buttons": []},
         _prior_section=None,
+        _doc_uid=switch_uid,
     )
-    await _safe_answer(message, preview, parse_mode="Markdown", reply_markup=confirm_kb)
+    # Paginated, scannable preview (one record = 3 lines) instead of a wall of text.
+    total_pages = max(1, (len(actions) + _IMPORT_PAGE_SIZE - 1) // _IMPORT_PAGE_SIZE)
+    text = _format_import_page(actions, 0) + overflow
+    await _safe_answer(message, text, parse_mode="Markdown",
+                       reply_markup=_import_preview_keyboard(0, total_pages, switch_uid))
+
+
+async def _ask_file_intent(message: Message, file_unique_id: str, label: str) -> None:
+    """Ask what to do with a genuinely ambiguous file (a caption-less PDF —
+    could be a contract to read or an exported task list to import)."""
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📄 Tahlil", callback_data=f"docact:analyze:{file_unique_id}"),
+        InlineKeyboardButton(text="📋 Import", callback_data=f"docact:import:{file_unique_id}"),
+        InlineKeyboardButton(text="📝 Qayd", callback_data=f"docact:note:{file_unique_id}"),
+    ]])
+    await message.answer(f"📎 *{label}* — bu fayl bilan nima qilay?",
+                         parse_mode="Markdown", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("docact:"))
+async def cb_doc_action(query: CallbackQuery, state: FSMContext) -> None:
+    """Route a cached file to analyse / import / note — fired by the ambiguous-PDF
+    ask prompt or by a result's one-tap switch button."""
+    try:
+        _, action, uid = query.data.split(":", 2)
+    except ValueError:
+        await query.answer()
+        return
+    entry = _DOC_FLIP_CACHE.get(uid)
+    if not entry:
+        await query.answer("Fayl topilmadi — qayta yuboring.", show_alert=True)
+        return
+    await query.answer()
+    try:  # strip the buttons so the prompt/switch can't be double-tapped
+        await query.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+
+    name = entry.get("name") or "fayl"
+    kind = entry.get("kind") or document_service.detect_kind(name, entry.get("mime") or "")
+
+    if action == "note":
+        # Choosing "save as note" supersedes any pending task-confirm from the
+        # analysis — clear it so a stray follow-up message isn't mis-handled.
+        await state.clear()
+        await _capture_file_as_note(query.message, label=name)
+        return
+    if action == "analyze":
+        # _analyze_document downloads the file itself (by file_id).
+        await _analyze_document(
+            query.message, state, instruction="",
+            file_id=entry["file_id"], file_unique_id=uid,
+            file_name=name, mime=entry.get("mime") or "", kind=kind,
+        )
+        return
+    # import → needs the raw bytes here.
+    try:
+        file = await query.message.bot.get_file(entry["file_id"])
+        blob = await query.message.bot.download_file(file.file_path)
+        data = blob.read() if hasattr(blob, "read") else blob
+    except Exception as e:
+        await query.message.answer(_humanize_error(e))
+        return
+    await _import_tasks_from_file_bytes(query.message, state, data, name, switch_uid=uid)
+
+
+@router.callback_query(F.data.startswith("docedit:"))
+async def cb_doc_edit(query: CallbackQuery, state: FSMContext) -> None:
+    """✏️ Tahrirla — revise the document analysis via a follow-up instruction
+    (same concept as the polish '✏️ Tahrirla'). Re-analyses the SAME cached file."""
+    uid = query.data.split(":", 1)[1]
+    if uid not in _DOC_FLIP_CACHE:
+        await query.answer("Fayl keshi eskirdi — qayta yuboring.", show_alert=True)
+        return
+    await query.answer()
+    try:
+        await query.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    await state.set_state(DocReviseFSM.awaiting)
+    await state.update_data(revise_uid=uid)
+    await query.message.answer(
+        "✏️ **Qanday o'zgartiray?**\n\nKo'rsatma yuboring (matn yoki ovoz) — masalan: "
+        "«summasini ham hisobla», «faqat 1-vazifani yarat», «deadline 10-iyun qil».",
+        parse_mode="Markdown",
+    )
+
+
+@router.message(StateFilter(DocReviseFSM.awaiting), F.text | F.voice)
+async def handle_doc_revision(message: Message, state: FSMContext) -> None:
+    """Revision instruction for a document analysis — re-analyse the same cached
+    file with that instruction (text, or transcribed voice)."""
+    instr = await _get_text_or_transcribe(message, bot=message.bot)
+    if instr is None:
+        return
+    data = await state.get_data()
+    uid = data.get("revise_uid") or ""
+    await state.clear()
+    entry = _DOC_FLIP_CACHE.get(uid)
+    if not entry:
+        await message.answer("Hujjat keshi eskirdi — faylni qayta yuboring.")
+        return
+    kind = entry.get("kind") or document_service.detect_kind(
+        entry.get("name") or "", entry.get("mime") or "")
+    await _analyze_document(
+        message, state, instruction=instr,
+        file_id=entry["file_id"], file_unique_id=uid,
+        file_name=entry.get("name") or "fayl", mime=entry.get("mime") or "", kind=kind,
+    )
 
 
 @router.message(Command("diagnostics"))
@@ -2296,7 +3071,7 @@ async def cmd_diagnostics(message: Message) -> None:
     import os
     import claude_service
     DIVIDER = "━" * 20
-    lines = ["🔍  **DIAGNOSTICS**", "", DIVIDER, ""]
+    lines = ["🩺  **DIAGNOSTIKA**", "", DIVIDER, ""]
 
     # DB size
     try:
@@ -2358,6 +3133,21 @@ async def cmd_diagnostics(message: Message) -> None:
     bg = len(_background_tasks)
     lines.append(f"🔧 Background tasks: {bg}")
 
+    # Audit — so'nggi amallar (qayta ishlangan kiritmalar tarixi)
+    try:
+        recent = await database.list_recent_actions(limit=8)
+        if recent:
+            lines.extend(["", DIVIDER, "", "📜 **So'nggi amallar:**"])
+            for r in recent:
+                ts = _short_local_date(r.get("completed_at") or r.get("updated_at"))
+                badge = "✅" if r.get("state") == "completed" else "❌"
+                txt = (r.get("user_text") or "—").strip().replace("\n", " ")
+                if len(txt) > 44:
+                    txt = txt[:41] + "…"
+                lines.append(f"  {badge} {ts} · {_escape_markdown(txt)}")
+    except Exception:
+        logger.debug("audit recent-actions section failed", exc_info=True)
+
     lines.extend(["", DIVIDER])
     await _safe_answer(message, "\n".join(lines), parse_mode="Markdown",
                        reply_markup=single_back_keyboard())
@@ -2375,7 +3165,7 @@ async def cmd_help(message: Message) -> None:
         "**3. Eslatmalar**\n"
         "• `/reminders` — alohida eslatmalar, snooze, takrorlash va bajarildi nazorati.\n\n"
         "**4. Notes (Inbox)**\n"
-        "• `/notes` — qayta ishlanmagan note'lar inbox'i (GTD uslubi).\n"
+        "• `/notes` — qayta ishlanmagan qaydlar inbox'i (GTD uslubi).\n"
         "• `/qayd <matn>` — tezkor note qo'shish.\n"
         "• Boshqa chatdan xabarni forward qiling — avto note'ga aylanadi.\n"
         "• Voice: _\"qayd qil: ...\"_ — ovozdan ham mumkin.\n\n"
@@ -3184,6 +3974,8 @@ def _format_task_detail_card(t: dict, idx: int = None) -> str:
         f"⚡ Ustuvorlik: {priority_name}",
         f"{status_emoji} Holat: {status_uz}",
     ]
+    if (t.get("category") or "").strip():
+        lines.append(f"📁 Kategoriya: {t.get('category').strip()}")
     if description:
         lines.append(f"📝 Tavsif: {description}")
     if tags:
@@ -3208,6 +4000,7 @@ def _truncate(s: str, n: int = _MAX_TITLE_COMPACT) -> str:
 def _format_recurrence_label(rule: str | None) -> str:
     labels = {
         "daily": "har kuni",
+        "weekdays": "ish kunlari (Dush–Juma)",
         "weekly": "har hafta",
         "monthly": "har oy",
         "quarterly": "har chorak",
@@ -3550,7 +4343,7 @@ def _format_reminders_compact(
 
 def reminders_compact_keyboard(
     reminders: list[dict],
-    current_filter: str = "upcoming",
+    current_filter: str = "active",
     page: int = 1,
 ) -> InlineKeyboardMarkup | None:
     per_page = _REMINDERS_PER_PAGE
@@ -3580,32 +4373,50 @@ def reminders_compact_keyboard(
 
 
 def reminder_detail_menu(reminder: dict) -> InlineKeyboardMarkup:
+    """Eslatma holatiga moslashuvchi tugmalar:
+      • done            → ↺ Qayta eslat / o'chir / orqaga
+      • takroriy (scheduled) → ⏭ Bu safarni o'tkaz / 🛑 To'xtatish / tahrir
+      • bir martalik (scheduled/sent) → ✅ Bajarildi / snooze / tahrir
+    Ikonka izchilligi: snooze hammasi ⏰; vaqt tahriri 🕐 (snooze-Ertaga'dan farqli)."""
     rid = reminder["id"]
-    if reminder.get("status") in {"done", "sent"}:
+    status = reminder.get("status")
+    is_recurring = bool((reminder.get("recurrence_rule") or "").strip())
+    # Konsolidatsiya: bitta '✏️ Tahrirlash' → submenu (Sarlavha/Vaqt/Takror/Izoh).
+    edit_row = [
+        InlineKeyboardButton(text="✏️ Tahrirlash", callback_data=f"remeditmenu:{rid}"),
+    ]
+    tail_row = [
+        InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"remdel:{rid}"),
+        InlineKeyboardButton(text="⬅️ Ro'yxatga", callback_data="remfilter:active"),
+    ]
+    # Done — reopen / EDIT (vaqt tahriri qayta faollashtiradi) / delete / back.
+    if status == "done":
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="↺ Qayta eslat", callback_data=f"remsnooze:{rid}:1d")],
+            edit_row,
+            tail_row,
+        ])
+    # Recurring (stays 'scheduled' — fires roll forward): skip THIS occurrence
+    # vs stop the whole series. NOT a plain "Bajarildi" (that ended the series).
+    if is_recurring and status == "scheduled":
         return InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="↺ Qayta eslat", callback_data=f"remsnooze:{rid}:1d"),
-                InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"remdel:{rid}"),
+                InlineKeyboardButton(text="⏭ Bu safarni o'tkaz", callback_data=f"remskip:{rid}"),
+                InlineKeyboardButton(text="🛑 Takrorni to'xtatish", callback_data=f"remstop:{rid}"),
             ],
-            [InlineKeyboardButton(text="⬅️ Ro'yxatga", callback_data="remfilter:upcoming")],
+            edit_row,
+            tail_row,
         ])
+    # One-time scheduled OR sent (fired): done + snooze (⏰) + edit.
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Bajarildi", callback_data=f"remdone:{rid}")],
         [
-            InlineKeyboardButton(text="✅ Bajarildi", callback_data=f"remdone:{rid}"),
             InlineKeyboardButton(text="⏰ 15 daq", callback_data=f"remsnooze:{rid}:15m"),
+            InlineKeyboardButton(text="⏰ 1 soat", callback_data=f"remsnooze:{rid}:1h"),
+            InlineKeyboardButton(text="⏰ Ertaga", callback_data=f"remsnooze:{rid}:1d"),
         ],
-        [
-            InlineKeyboardButton(text="🕐 1 soat", callback_data=f"remsnooze:{rid}:1h"),
-            InlineKeyboardButton(text="📅 Ertaga", callback_data=f"remsnooze:{rid}:1d"),
-        ],
-        [
-            InlineKeyboardButton(text="✏️ Matn", callback_data=f"remedit:{rid}:title"),
-            InlineKeyboardButton(text="📆 Vaqt", callback_data=f"remedit:{rid}:time"),
-        ],
-        [
-            InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"remdel:{rid}"),
-            InlineKeyboardButton(text="⬅️ Ro'yxatga", callback_data="remfilter:upcoming"),
-        ],
+        edit_row,
+        tail_row,
     ])
 
 
@@ -3616,12 +4427,15 @@ async def _load_reminders_for_filter(filt: str) -> tuple[list[dict], str]:
         return await database.list_reminders(status_in=["sent", "done"], limit=200), "Yuborilgan / bajarilgan"
     if filt == "all":
         return await database.list_reminders(limit=200), "Barchasi"
+    if filt == "active":
+        # Default ko'rinish — bajarilmaganlar (rejalangan + yuborilgan), done'siz.
+        return await database.list_reminders(status_in=["scheduled", "sent"], limit=200), "Aktiv eslatmalar"
     return await database.list_reminders(status_in=["scheduled"], limit=200), "Keyingi eslatmalar"
 
 
 async def _render_reminders_for_filter(
     message: Message,
-    filt: str = "upcoming",
+    filt: str = "active",
     page: int = 1,
     edit_existing: bool = False,
 ) -> None:
@@ -3642,19 +4456,19 @@ async def _render_reminders_for_filter(
 
 def _format_notes_compact(notes: list[dict], label: str,
                             inbox_count: int = 0, page: int = 1) -> str:
-    """One-screen compact list — card per note with source badge + preview."""
-    DIVIDER = "━" * 20
-    head = [f"📝 **NOTES · {label.upper()}**", ""]
-    head.append(f"📥 Inbox: **{inbox_count}** ta qayta ishlanmagan")
-    head.append("")
-    head.append(DIVIDER)
-    head.append("")
+    """Sana bo'yicha guruhlangan ro'yxat (Variant B): qaydlar
+    BUGUN / KECHA / BU HAFTA / OLDIN bo'lib ajratiladi. Har band oldida manba
+    ikonkasi (🎙/✍️/🔁/⚡/🤖); raqamlar saqlanadi — pastdagi 1..N tugmalari
+    aynan shu qaydlarga mos keladi."""
+    DIVIDER = "━" * 15
     if not notes:
-        head.append("_Hozircha bu bo'limda note yo'q._")
-        head.append("")
-        head.append("Tezkor qo'shish: `/qayd <matn>` yoki ovoz orqali "
-                     "_\"qayd qil: ...\"_.")
-        return "\n".join(head).rstrip()
+        return "\n".join([
+            f"📝 **QAYDLAR · {label.upper()}**", "",
+            f"📥 Inbox: **{inbox_count}** ta qayta ishlanmagan", "",
+            DIVIDER, "",
+            "_Hozircha bu bo'limda qayd yo'q._", "",
+            "Tezkor qo'shish: `/qayd <matn>` yoki ovoz orqali _\"qayd qil: …\"_.",
+        ]).rstrip()
 
     per_page = _NOTES_PER_PAGE
     total = len(notes)
@@ -3663,24 +4477,46 @@ def _format_notes_compact(notes: list[dict], label: str,
     start = (page - 1) * per_page
     page_items = notes[start:start + per_page]
 
-    lines: list[str] = list(head)
+    today = datetime.now(database.TZ).date()
+
+    def _bucket(iso) -> int:
+        """0=BUGUN, 1=KECHA, 2=BU HAFTA, 3=OLDIN."""
+        try:
+            d = datetime.fromisoformat(iso).astimezone(database.TZ).date()
+        except (TypeError, ValueError):
+            return 3
+        delta = (today - d).days
+        if delta <= 0:
+            return 0
+        if delta == 1:
+            return 1
+        if delta <= 6:
+            return 2
+        return 3
+
+    _BUCKET_LABELS = {0: "BUGUN", 1: "KECHA", 2: "BU HAFTA", 3: "OLDIN"}
+    grouped: dict[int, list] = {0: [], 1: [], 2: [], 3: []}
     for i, n in enumerate(page_items, start=start + 1):
-        title = (n.get("title") or _derive_note_title_fallback(n.get("content", "")))
-        badge = _NOTES_SOURCE_BADGE.get(n.get("source", "manual"), "📝")
-        when = _short_local_date(n.get("created_at"))
-        meta = f"   📅 {when} · {badge}"
-        if n.get("source_chat"):
-            meta += f" · _{n['source_chat']}_"
-        preview = (n.get("content") or "").strip().replace("\n", " ")
-        if len(preview) > 120:
-            preview = preview[:117] + "…"
-        lines.append(f"**{i}. {title[:70]}**")
-        lines.append(meta)
-        if preview and preview != title:
-            lines.append(f"   _{_escape_markdown(preview)}_")
+        grouped[_bucket(n.get("created_at"))].append((i, n))
+
+    lines = [f"📝 **QAYDLAR · {label.upper()} · {total} ta**", "", DIVIDER]
+    for b in (0, 1, 2, 3):
+        items = grouped[b]
+        if not items:
+            continue
         lines.append("")
+        lines.append(f"📅 **{_BUCKET_LABELS[b]}**")
+        for i, n in items:
+            title = (n.get("title") or _derive_note_title_fallback(n.get("content", "")))
+            icon = _NOTES_SOURCE_ICON.get(n.get("source", "manual"), "📝")
+            preview = (n.get("content") or "").strip().replace("\n", " ")
+            if len(preview) > 90:
+                preview = preview[:87] + "…"
+            lines.append(f"  {icon} {i}. {_escape_markdown(title[:64])}")
+            if preview and preview != title:
+                lines.append(f"      _{_escape_markdown(preview)}_")
     if total_pages > 1:
-        lines.append(f"_Sahifa {page}/{total_pages}_")
+        lines += ["", DIVIDER, f"_Sahifa {page}/{total_pages}_"]
     return "\n".join(lines).rstrip()
 
 
@@ -3720,12 +4556,10 @@ def notes_compact_keyboard(notes: list[dict], current_filter: str = "inbox",
     if nums:
         for i in range(0, len(nums), 5):
             rows.append(nums[i:i + 5])
-    # Filter pills
-    rows.append([
-        InlineKeyboardButton(text="📥 Inbox", callback_data="notesfilter:inbox"),
-        InlineKeyboardButton(text="⚙️ Ishlangan", callback_data="notesfilter:processed"),
-        InlineKeyboardButton(text="📦 Arxiv", callback_data="notesfilter:archived"),
-    ])
+    # KONSEPSIYA: filtrlar (Inbox/Ishlangan/Arxiv) ataylab BU YERDA YO'Q — ular
+    # doimiy reply-klaviaturada (notes_section_reply_keyboard) turadi. Inline faqat
+    # kontentga xos: drill-down raqamlar + pagination. Shu bilan inline↔reply
+    # tugma takrori oldi olinadi (avval bir xil filtrlar ikkala joyda chiqardi).
     if total_pages > 1:
         nav: list[InlineKeyboardButton] = []
         if page > 1:
@@ -3761,7 +4595,11 @@ def note_detail_menu(note: dict) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="⏰ Eslatmaga", callback_data=f"notetorem:{nid}"),
         ])
         rows.append([
-            InlineKeyboardButton(text="📦 Arxiv", callback_data=f"notearchive:{nid}"),
+            InlineKeyboardButton(text="✂️ Ko'p vazifaga ajrat", callback_data=f"notesplit:{nid}"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="✅ Ishlandi", callback_data=f"notedone:{nid}"),
+            InlineKeyboardButton(text="📦 Arxivga", callback_data=f"notearchive:{nid}"),
             InlineKeyboardButton(text="🗑 O'chir", callback_data=f"notedelete:{nid}"),
         ])
     rows.append([
@@ -3839,6 +4677,8 @@ async def _render_tasks_for_filter(message: Message, filt: str = "active",
     If edit_existing=True (called from a callback), edits the existing message
     instead of sending a new one — keeps the chat tidy.
     """
+    global _last_task_filter
+    _last_task_filter = filt
     if filt == "active":
         tasks = await database.list_tasks(status_in=["todo", "in_progress", "blocked"], limit=200)
         label = "Aktiv vazifalar"
@@ -3901,6 +4741,321 @@ async def cmd_tasks(message: Message, state: FSMContext | None = None) -> None:
     await _render_tasks_for_filter(message, "active")
 
 
+_CATEGORY_ICONS = ["📁", "🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "⭐",
+                   "💼", "📊", "📢", "🤝", "🛒", "💻", "🎯", "🗓"]
+
+
+def _categories_keyboard(cats: list[dict]) -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for c in cats:
+        row.append(InlineKeyboardButton(text=f"{c['icon']} {c['name']} ({c['count']})",
+                                        callback_data=f"taskcat:{c['name']}"[:64]))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton(text="➕ Yangi kategoriya", callback_data="catnew"),
+        InlineKeyboardButton(text="📦 Arxiv", callback_data="catarchlist"),
+    ])
+    rows.append([back_button("nav_cockpit", "⬅️ Orqaga")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _render_categories(message: Message, edit_existing: bool = False) -> None:
+    """The 'Kategoriyalar' overview — managed categories (icon + count) with
+    add / archive entry points; tap a category for its tasks + management."""
+    cats = await database.list_categories()
+    DIV = "━" * 20
+    if not cats:
+        text = ("🗄 **KATEGORIYALAR**\n\n_Hozircha kategoriya yo'q._\n\n"
+                "«➕ Yangi kategoriya» bilan qo'shing — yoki vazifa yaratganда avtomatik belgilanadi.")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Yangi kategoriya", callback_data="catnew")],
+            [back_button("nav_cockpit", "⬅️ Orqaga")],
+        ])
+    else:
+        total = sum(c["count"] for c in cats)
+        lines = ["🗄 **KATEGORIYALAR**", "", f"_{len(cats)} ta kategoriya · {total} ta aktiv vazifa_", "", DIV, ""]
+        for c in cats:
+            lines.append(f"{c['icon']} **{c['name']}** — {c['count']} ta")
+        lines.extend(["", DIV, "", "_Kategoriyani bosing — vazifalari va boshqaruv._"])
+        text = "\n".join(lines)
+        kb = _categories_keyboard(cats)
+    if edit_existing:
+        try:
+            await message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+            return
+        except TelegramBadRequest:
+            pass
+    await _safe_answer(message, text, parse_mode="Markdown", reply_markup=kb)
+
+
+async def _render_archived_categories(message: Message, edit_existing: bool = True) -> None:
+    cats = await database.list_categories(include_archived=True)
+    DIV = "━" * 20
+    if not cats:
+        text = "📦 **ARXIV**\n\n_Arxivlangan kategoriya yo'q._"
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅️ Kategoriyalar", callback_data="taskcats")]])
+    else:
+        lines = ["📦 **ARXIVLANGAN KATEGORIYALAR**", "", DIV, ""]
+        for c in cats:
+            lines.append(f"{c['icon']} **{c['name']}** — {c['count']} ta")
+        lines.extend(["", DIV, "", "_Tiklash uchun bosing._"])
+        text = "\n".join(lines)
+        rows = [[InlineKeyboardButton(text=f"♻️ {c['icon']} {c['name']}",
+                                      callback_data=f"catunarch:{c['name']}"[:64])] for c in cats]
+        rows.append([InlineKeyboardButton(text="⬅️ Kategoriyalar", callback_data="taskcats")])
+        kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    if edit_existing:
+        try:
+            await message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+            return
+        except TelegramBadRequest:
+            pass
+    await _safe_answer(message, text, parse_mode="Markdown", reply_markup=kb)
+
+
+def _category_drilldown_kb(cat: str, tasks: list[dict]) -> InlineKeyboardMarkup:
+    nums = [InlineKeyboardButton(text=str(i + 1), callback_data=f"taskopen:{t['id']}")
+            for i, t in enumerate(tasks[:_TASKS_PER_PAGE])]
+    rows = [nums[j:j + 5] for j in range(0, len(nums), 5)]
+    if cat == "(boshqa)":  # synthetic uncategorized bucket — no rename/archive/move
+        rows.append([
+            InlineKeyboardButton(text="➕ Vazifa", callback_data=f"catadd:{cat}"[:64]),
+            InlineKeyboardButton(text="🧹 Vazifalar", callback_data=f"cattasksdel:{cat}"[:64]),
+        ])
+    else:
+        rows.append([
+            InlineKeyboardButton(text="➕ Vazifa", callback_data=f"catadd:{cat}"[:64]),
+            InlineKeyboardButton(text="✏️ Tahrir", callback_data=f"catedit:{cat}"[:64]),
+            InlineKeyboardButton(text="📦 Arxiv", callback_data=f"catarch:{cat}"[:64]),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="🗑 Kategoriya", callback_data=f"catdel:{cat}"[:64]),
+            InlineKeyboardButton(text="🧹 Vazifalar", callback_data=f"cattasksdel:{cat}"[:64]),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="⬆️ Yuqoriga", callback_data=f"catmove:{cat}:up"[:64]),
+            InlineKeyboardButton(text="⬇️ Pastga", callback_data=f"catmove:{cat}:down"[:64]),
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Kategoriyalar", callback_data="taskcats")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _render_category_drilldown(message: Message, cat: str, edit_existing: bool = True) -> None:
+    tasks = await database.list_tasks_by_category(cat)
+    text = (_format_tasks_compact(tasks, f"Kategoriya: {cat}") if tasks
+            else f"📁 **«{cat}»** — bo'sh.")
+    kb = _category_drilldown_kb(cat, tasks)
+    if edit_existing:
+        try:
+            await message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+            return
+        except TelegramBadRequest:
+            pass
+    await _safe_answer(message, text, parse_mode="Markdown", reply_markup=kb)
+
+
+@router.message(Command("categories"))
+async def cmd_categories(message: Message) -> None:
+    await _render_categories(message)
+
+
+@router.callback_query(F.data == "taskcats")
+async def cb_task_categories(query: CallbackQuery) -> None:
+    await query.answer()
+    await _render_categories(query.message, edit_existing=True)
+
+
+@router.callback_query(F.data == "catarchlist")
+async def cb_archived_categories(query: CallbackQuery) -> None:
+    await query.answer()
+    await _render_archived_categories(query.message, edit_existing=True)
+
+
+@router.callback_query(F.data.startswith("taskcat:"))
+async def cb_task_category(query: CallbackQuery) -> None:
+    cat = query.data.split(":", 1)[1]
+    await query.answer()
+    await _render_category_drilldown(query.message, cat, edit_existing=True)
+
+
+# ── Edit (rename + icon), archive, reorder ──
+class CategoryNameFSM(StatesGroup):
+    awaiting = State()
+
+
+def _icon_picker_kb(name: str) -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for ic in _CATEGORY_ICONS:
+        row.append(InlineKeyboardButton(text=ic, callback_data=f"caticon:{name}:{ic}"[:64]))
+        if len(row) == 4:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"catedit:{name}"[:64])])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "catnew")
+async def cb_category_new(query: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(CategoryNameFSM.awaiting)
+    await state.update_data(mode="create")
+    await query.answer()
+    await query.message.answer("➕ Yangi kategoriya nomini yozing (matn yoki ovoz):")
+
+
+@router.callback_query(F.data.startswith("catedit:"))
+async def cb_category_edit_menu(query: CallbackQuery) -> None:
+    name = query.data.split(":", 1)[1]
+    await query.answer()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Nomini o'zgartirish", callback_data=f"catrename:{name}"[:64])],
+        [InlineKeyboardButton(text="🎨 Ikonka", callback_data=f"caticonpick:{name}"[:64])],
+        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"taskcat:{name}"[:64])],
+    ])
+    await _safe_answer(query.message, f"✏️ **«{name}»** — tahrirlash:", parse_mode="Markdown", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("catrename:"))
+async def cb_category_rename(query: CallbackQuery, state: FSMContext) -> None:
+    name = query.data.split(":", 1)[1]
+    await state.set_state(CategoryNameFSM.awaiting)
+    await state.update_data(mode="rename", old=name)
+    await query.answer()
+    await query.message.answer(f"✏️ «{name}» uchun yangi nom yozing:")
+
+
+@router.message(StateFilter(CategoryNameFSM.awaiting), F.text | F.voice)
+async def handle_category_name(message: Message, state: FSMContext, bot: Bot) -> None:
+    name = await _get_text_or_transcribe(message, bot=bot)
+    if name is None:
+        return
+    name = name.strip()[:60]
+    data = await state.get_data()
+    mode = data.get("mode")
+    await state.clear()
+    if not name:
+        await message.answer("Bo'sh nom — bekor qilindi.")
+        return
+    if mode == "rename":
+        old = data.get("old")
+        await database.update_category(old, new_name=name)
+        await message.answer(f"✅ «{old}» → «{name}»")
+    else:
+        await database.create_category(name)
+        await message.answer(f"✅ «{name}» kategoriyasi yaratildi.")
+    await _render_categories(message)
+
+
+@router.callback_query(F.data.startswith("caticonpick:"))
+async def cb_category_icon_pick(query: CallbackQuery) -> None:
+    name = query.data.split(":", 1)[1]
+    await query.answer()
+    await _safe_answer(query.message, f"🎨 «{name}» uchun ikonka tanlang:", reply_markup=_icon_picker_kb(name))
+
+
+@router.callback_query(F.data.startswith("caticon:"))
+async def cb_category_set_icon(query: CallbackQuery) -> None:
+    _, name, icon = query.data.split(":", 2)
+    await database.update_category(name, icon=icon)
+    await query.answer(f"Ikonka → {icon} ✅")
+    await _render_categories(query.message, edit_existing=True)
+
+
+@router.callback_query(F.data.startswith("catarch:"))
+async def cb_category_archive(query: CallbackQuery) -> None:
+    name = query.data.split(":", 1)[1]
+    await database.archive_category(name, True)
+    await query.answer(f"📦 «{name}» arxivlandi")
+    await _render_categories(query.message, edit_existing=True)
+
+
+@router.callback_query(F.data.startswith("catunarch:"))
+async def cb_category_unarchive(query: CallbackQuery) -> None:
+    name = query.data.split(":", 1)[1]
+    await database.archive_category(name, False)
+    await query.answer(f"♻️ «{name}» tiklandi")
+    await _render_archived_categories(query.message, edit_existing=True)
+
+
+@router.callback_query(F.data.startswith("catmove:"))
+async def cb_category_move(query: CallbackQuery) -> None:
+    _, name, direction = query.data.split(":", 2)
+    ok = await database.move_category(name, direction)
+    await query.answer("✅ Ko'chirildi" if ok else "Chekkada")
+    await _render_category_drilldown(query.message, name, edit_existing=True)
+
+
+class AddToCategoryFSM(StatesGroup):
+    awaiting = State()
+
+
+async def _confirm_actions(query: CallbackQuery, state: FSMContext, actions: list[dict], done_msg: str) -> None:
+    """Route button-triggered actions through the standard preview + Tasdiq gate."""
+    preview = await _format_create_preview(actions)
+    await state.set_state(CreateActionConfirmFSM.awaiting)
+    await state.update_data(
+        pending_response={"actions": actions, "user_message": done_msg, "buttons": []},
+        _prior_section=None,
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Tasdiqlayman", callback_data="acts_confirm"),
+        InlineKeyboardButton(text="✕ Bekor", callback_data="acts_cancel"),
+    ]])
+    await _safe_answer(query.message, preview, parse_mode="Markdown", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("catdel:"))
+async def cb_category_clear(query: CallbackQuery, state: FSMContext) -> None:
+    """Delete a category label (tasks survive → uncategorized). Confirm-gated."""
+    cat = query.data.split(":", 1)[1]
+    await query.answer()
+    await _confirm_actions(query, state, [{"type": "delete_category", "data": {"category": cat}}],
+                           f"✅ «{cat}» kategoriyasi olib tashlandi.")
+
+
+@router.callback_query(F.data.startswith("cattasksdel:"))
+async def cb_category_delete_tasks(query: CallbackQuery, state: FSMContext) -> None:
+    """Delete ALL tasks in a category. Confirm-gated."""
+    cat = query.data.split(":", 1)[1]
+    await query.answer()
+    await _confirm_actions(query, state, [{"type": "delete_tasks_by_category", "data": {"category": cat}}],
+                           f"✅ «{cat}» kategoriyasidagi vazifalar o'chirildi.")
+
+
+@router.callback_query(F.data.startswith("catadd:"))
+async def cb_category_add_task(query: CallbackQuery, state: FSMContext) -> None:
+    """Add a task into a specific category — prompt for the title."""
+    cat = query.data.split(":", 1)[1]
+    await state.set_state(AddToCategoryFSM.awaiting)
+    await state.update_data(category=cat)
+    await query.answer()
+    await query.message.answer(
+        f"➕ **«{cat}»** kategoriyasiga yangi vazifa.\nVazifa nomini yozing (matn yoki ovoz):",
+        parse_mode="Markdown",
+    )
+
+
+@router.message(StateFilter(AddToCategoryFSM.awaiting), F.text | F.voice)
+async def handle_add_to_category(message: Message, state: FSMContext, bot: Bot) -> None:
+    title = await _get_text_or_transcribe(message, bot=bot)
+    if title is None:
+        return
+    title = title.strip()
+    data = await state.get_data()
+    cat = data.get("category") or None
+    await state.clear()
+    if not title:
+        await message.answer("Bo'sh nom — bekor qilindi.")
+        return
+    tid = await database.create_task({"title": title, "category": cat, "priority": "P2", "status": "todo"})
+    await message.answer(f"✅ «{cat}» kategoriyasiga qo'shildi:\n📌 {title}",
+                         reply_markup=_task_card_kb_with_back(await database.get_task(tid)))
+
+
 @router.message(Command("reminders"))
 async def cmd_reminders(message: Message, state: FSMContext | None = None) -> None:
     if state is not None:
@@ -3909,13 +5064,13 @@ async def cmd_reminders(message: Message, state: FSMContext | None = None) -> No
         "⏰ **ESLATMALAR**", parse_mode="Markdown",
         reply_markup=reminders_section_reply_keyboard(),
     )
-    await _render_reminders_for_filter(message, "upcoming")
+    await _render_reminders_for_filter(message, "active")
 
 
 @router.callback_query(F.data.startswith("remfilter:"))
 async def cb_reminder_filter(query: CallbackQuery) -> None:
     parts = query.data.split(":")
-    filt = parts[1] if len(parts) > 1 and parts[1] else "upcoming"
+    filt = parts[1] if len(parts) > 1 and parts[1] else "active"
     page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
     await query.answer()
     await _render_reminders_for_filter(query.message, filt, page=page, edit_existing=True)
@@ -3931,7 +5086,7 @@ async def cmd_notes(message: Message, state: FSMContext | None = None) -> None:
     if state is not None:
         await state.set_state(SectionFSM.in_notes)
     await message.answer(
-        "📝 **NOTES**", parse_mode="Markdown",
+        "📝 **QAYDLAR**", parse_mode="Markdown",
         reply_markup=notes_section_reply_keyboard(),
     )
     await _render_notes_for_filter(message, "inbox")
@@ -3978,21 +5133,33 @@ _RESERVED_LABELS = {v for k, v in dict(globals()).items()
 
 
 def _is_note_noise(text: str) -> bool:
-    """True if `text` is NOT a real note: a slash command, or a tapped
-    reply-keyboard button label (e.g. '⬅️ Asosiy menyu'). Prevents junk notes."""
+    """True if `text` is NOT a real note: empty, a slash command, or a tapped
+    reply-keyboard / section button label (e.g. '⬅️ Asosiy menyu', '/team').
+    Prevents junk notes from accidental taps/commands."""
     t = (text or "").strip()
-    return (not t) or t.startswith("/") or t in _RESERVED_LABELS
+    return ((not t) or t.startswith("/")
+            or t in _RESERVED_LABELS or t in _SECTION_LABELS)
+
+
+def _looks_like_bot_output(text: str) -> bool:
+    """Heuristic: `text` is THIS bot's own rendered panel forwarded back to it
+    (e.g. '📌 VAZIFALAR … Natija · 9 ta … ━━━'), not an external note. Bot panels
+    use long ━ dividers together with 'Natija ·' / 'Ko'rinish ·' / 'UMUMIY HOLAT'
+    labels that a human-written note would not contain."""
+    t = text or ""
+    return ("━━━" in t) and any(
+        m in t for m in ("Natija ·", "Ko'rinish ·", "Koʻrinish ·", "UMUMIY HOLAT"))
 
 
 @router.message(StateFilter(NoteCaptureFSM.awaiting_text), F.text | F.voice)
 async def handle_note_capture(message: Message, state: FSMContext) -> None:
-    """One-shot capture: next text/voice after /qayd or '➕ Yangi note' button."""
+    """One-shot capture: next text/voice after /qayd or '➕ Yangi qayd' button."""
     content = await _get_text_or_transcribe(message)
     if not content:
         return
     content = content.strip()
     if not content:
-        await message.answer("Bo'sh xabar — note yaratilmadi.")
+        await message.answer("Bo'sh xabar — qayd yaratilmadi.")
         return
     # A tapped nav button or command isn't a note — cancel capture, let it route.
     if _is_note_noise(content):
@@ -4010,12 +5177,15 @@ async def handle_note_capture(message: Message, state: FSMContext) -> None:
 
 async def _note_capture_reply(message: Message, note_id: str, source_hint: str) -> None:
     """Compact confirmation right after a note is captured."""
+    # 'Inbox'ga' to'liq bo'limga kiradi (nav_notes → reply-filtrlar bilan), shunda
+    # ro'yxat doimo reply navigatsiya bilan birga ko'rinadi (notesfilter endi faqat
+    # pagination uchun — har doim bo'lim ichida).
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📥 Inbox'ga", callback_data="notesfilter:inbox"),
+        InlineKeyboardButton(text="📥 Inbox'ga", callback_data="nav_notes"),
         InlineKeyboardButton(text="🤖 Hozir tahlil", callback_data=f"noteanalyze:{note_id}"),
     ]])
     await message.answer(
-        f"📝 **Note saqlandi** · `{note_id}`\n_Manba: {source_hint}_",
+        f"📝 **Qayd saqlandi** · `{note_id}`\n_Manba: {source_hint}_",
         parse_mode="Markdown",
         reply_markup=kb,
     )
@@ -4064,7 +5234,7 @@ def _format_note_detail(note: dict) -> tuple[str, str]:
     when = _short_local_date(note.get("created_at"))
     status_uz = {
         "inbox": "📥 Inbox",
-        "processed": "⚙️ Qayta ishlangan",
+        "processed": "⚙️ Ishlangan",
         "archived": "📦 Arxiv",
     }.get(note.get("status"), note.get("status") or "—")
 
@@ -4072,21 +5242,30 @@ def _format_note_detail(note: dict) -> tuple[str, str]:
     parts: list[str] = [
         f"📝 <b>{_html_escape(title)}</b>",
         "",
-        f"📅 {_html_escape(when)} · {_html_escape(badge)}",
+        # Bitta ixcham meta qator: manba · sana · holat
+        f"{_html_escape(badge)} · 📅 {_html_escape(when)} · {_html_escape(status_uz)}",
     ]
+    tags = note.get("tags") or []
+    if tags:
+        parts.append("🏷 " + " ".join(f"#{_html_escape(str(t))}" for t in tags[:8]))
     if note.get("source_chat"):
         parts.append(f"💬 Chat: <i>{_html_escape(note['source_chat'])}</i>")
     if note.get("source_author"):
         parts.append(f"👤 Muallif: <i>{_html_escape(note['source_author'])}</i>")
-    parts.append(f"🔖 Holat: {_html_escape(status_uz)}")
     if note.get("converted_to_type") and note.get("converted_to_id"):
         link_label = "Vazifa" if note["converted_to_type"] == "task" else "Eslatma"
         parts.append(
             f"🔗 {link_label}: <code>{_html_escape(note['converted_to_id'])}</code>"
         )
-    tags = note.get("tags") or []
-    if tags:
-        parts.append("🏷 " + ", ".join(f"#{_html_escape(str(t))}" for t in tags[:8]))
+    # GTD: inbox'da qancha kun turgani — eski qaydni qayta ishlashga turtki
+    if note.get("status") == "inbox":
+        try:
+            _cd = datetime.fromisoformat(note.get("created_at")).astimezone(database.TZ)
+            _age = (datetime.now(database.TZ) - _cd).days
+            if _age >= 1:
+                parts.append(f"⏳ <b>{_age} kun</b> inbox'da kutyapti")
+        except (ValueError, TypeError):
+            pass
     parts.append("")
 
     # Body: prefer content_html (original Telegram entities preserved) for
@@ -4111,7 +5290,7 @@ async def cb_note_open(query: CallbackQuery) -> None:
     nid = query.data.split(":", 1)[1]
     note = await database.get_note(nid)
     if not note:
-        await query.answer("Note topilmadi", show_alert=True)
+        await query.answer("Qayd topilmadi", show_alert=True)
         return
     await query.answer()
     text, parse_mode = _format_note_detail(note)
@@ -4128,9 +5307,31 @@ async def cb_note_archive(query: CallbackQuery) -> None:
     nid = query.data.split(":", 1)[1]
     ok = await database.archive_note(nid)
     if not ok:
-        await query.answer("Note topilmadi", show_alert=True)
+        await query.answer("Qayd topilmadi", show_alert=True)
         return
     await query.answer("📦 Arxivga ko'chirildi ✅")
+    note = await database.get_note(nid)
+    if note:
+        text, parse_mode = _format_note_detail(note)
+        try:
+            await query.message.edit_text(
+                text, parse_mode=parse_mode,
+                reply_markup=note_detail_menu(note),
+            )
+        except TelegramBadRequest:
+            pass
+
+
+@router.callback_query(F.data.startswith("notedone:"))
+async def cb_note_done(query: CallbackQuery) -> None:
+    """'✅ Ishlandi' — mark a note processed WITHOUT converting (GTD: reviewed,
+    no action needed). The note leaves the inbox and moves to '⚙️ Ishlangan'."""
+    nid = query.data.split(":", 1)[1]
+    ok = await database.mark_note_done(nid)
+    if not ok:
+        await query.answer("Qayd topilmadi", show_alert=True)
+        return
+    await query.answer("✅ Ishlandi deb belgilandi")
     note = await database.get_note(nid)
     if note:
         text, parse_mode = _format_note_detail(note)
@@ -4153,7 +5354,7 @@ async def cb_note_restore(query: CallbackQuery) -> None:
         "converted_to_type": None,
     })
     if not ok:
-        await query.answer("Note topilmadi", show_alert=True)
+        await query.answer("Qayd topilmadi", show_alert=True)
         return
     await query.answer("📥 Inbox'ga qaytarildi ✅")
     note = await database.get_note(nid)
@@ -4175,7 +5376,7 @@ async def cb_note_delete(query: CallbackQuery) -> None:
     nid = query.data.split(":", 1)[1]
     note = await database.get_note(nid)
     if not note:
-        await query.answer("Note topilmadi", show_alert=True)
+        await query.answer("Qayd topilmadi", show_alert=True)
         return
     await query.answer()
     confirm_kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -4195,7 +5396,7 @@ async def cb_note_delete_confirm(query: CallbackQuery) -> None:
     nid = query.data.split(":", 1)[1]
     ok = await database.delete_note(nid)
     if not ok:
-        await query.answer("Note topilmadi", show_alert=True)
+        await query.answer("Qayd topilmadi", show_alert=True)
         return
     await query.answer("🗑 O'chirildi ✅")
     try:
@@ -4212,9 +5413,9 @@ async def cb_note_to_task(query: CallbackQuery) -> None:
     nid = query.data.split(":", 1)[1]
     note = await database.get_note(nid)
     if not note:
-        await query.answer("Note topilmadi", show_alert=True)
+        await query.answer("Qayd topilmadi", show_alert=True)
         return
-    title = (note.get("title") or note.get("content", "Note'dan vazifa")).strip()[:200]
+    title = (note.get("title") or note.get("content", "Qayddan vazifa")).strip()[:200]
     description = (note.get("content") or "").strip()
     if description == title:
         description = None
@@ -4235,7 +5436,7 @@ async def cb_note_to_task(query: CallbackQuery) -> None:
             query.message,
             "📝 **Note vazifaga aylantirildi**\n\n" + _format_task_card(task),
             parse_mode="Markdown",
-            reply_markup=task_inline_actions(task),
+            reply_markup=_task_card_kb_with_back(task),
         )
 
 
@@ -4246,9 +5447,9 @@ async def cb_note_to_reminder(query: CallbackQuery, state: FSMContext) -> None:
     nid = query.data.split(":", 1)[1]
     note = await database.get_note(nid)
     if not note:
-        await query.answer("Note topilmadi", show_alert=True)
+        await query.answer("Qayd topilmadi", show_alert=True)
         return
-    title = (note.get("title") or note.get("content", "Note'dan eslatma")).strip()[:200]
+    title = (note.get("title") or note.get("content", "Qayddan eslatma")).strip()[:200]
     # Hop into the existing new-reminder flow with title pre-set; the user
     # picks the time, and on submit we run mark_note_processed via a tag.
     await state.set_state(NewReminderFSM.awaiting_time)
@@ -4265,6 +5466,104 @@ async def cb_note_to_reminder(query: CallbackQuery, state: FSMContext) -> None:
     )
 
 
+def _build_note_split_directive(content: str) -> str:
+    """Directive: split a note's text into one create_task per actionable item."""
+    return (
+        "[INTERNAL] split_note_into_tasks\n\n"
+        "Quyidagi qayd matnini o'qib, undagi HAR BIR alohida bajariladigan ishni "
+        "ALOHIDA `create_task` action qilib chiqar. FAQAT matnda BOR ishlardan "
+        "foydalan — yangi ish, mas'ul yoki sana O'YLAB TOPMA. Agar matn aslida "
+        "bitta ish bo'lsa — bitta action qaytar. Har task uchun: title (qisqa, "
+        "aniq, buyruq ohangida), priority ('P2' default), deadline (matnda aniq "
+        "sana bo'lsa ISO8601, aks holda null). user_message — bitta qisqa qator.\n\n"
+        f"QAYD MATNI:\n{content}"
+    )
+
+
+@router.callback_query(F.data.startswith("notesplit:"))
+async def cb_note_split(query: CallbackQuery, state: FSMContext) -> None:
+    """'✂️ Ko'p vazifaga ajrat' — LLM qayd matnidan bir nechta vazifa ajratadi,
+    tasdiq so'raydi; tasdiqlangach hammasini yaratadi + qaydni 'ishlangan' qiladi."""
+    nid = query.data.split(":", 1)[1]
+    note = await database.get_note(nid)
+    if not note:
+        await query.answer("Qayd topilmadi", show_alert=True)
+        return
+    content = (note.get("content") or "").strip()
+    if not content:
+        await query.answer("Qayd bo'sh", show_alert=True)
+        return
+    await query.answer("✂️ Ajratilmoqda…")
+    typing = asyncio.create_task(_keep_typing(query.bot, query.message.chat.id))
+    try:
+        response = await claude_service.process_message(
+            "", internal_directive=_build_note_split_directive(content))
+    finally:
+        typing.cancel()
+    actions = [a for a in (response.get("actions") or []) if a.get("type") == "create_task"]
+    base_tags = list(note.get("tags") or []) + [f"note:{nid}"]
+    if not actions:
+        await query.message.answer("Vazifa topilmadi — qayd matnida aniq ish yo'q.")
+        return
+    if len(actions) == 1:
+        # Bitta ish — to'g'ridan yaratamiz (oddiy 'Vazifaga' kabi)
+        d = actions[0].get("data") or {}
+        tid = await database.create_task({
+            "title": (d.get("title") or content)[:200], "description": None,
+            "priority": d.get("priority") or "P2", "deadline": d.get("deadline"),
+            "status": "todo", "tags": base_tags, "source": "note",
+        })
+        await database.mark_note_processed(nid, "task", tid)
+        await query.message.answer("📝 Bitta vazifa yaratildi ✅ _(qayd ishlangan)_",
+                                    parse_mode="Markdown")
+        return
+    # 2+ ish → tasdiq darvozasi (standart create-preview)
+    await state.update_data(split_note_id=nid, split_actions=actions)
+    preview = await _format_create_preview(actions)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=f"✅ {len(actions)} ta vazifa yaratish", callback_data=f"notesplitok:{nid}"),
+        InlineKeyboardButton(text="✕ Bekor", callback_data=f"noteopen:{nid}"),
+    ]])
+    await query.message.answer(preview, parse_mode="Markdown", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("notesplitok:"))
+async def cb_note_split_ok(query: CallbackQuery, state: FSMContext) -> None:
+    """Tasdiqlangan ko'p-vazifa: hammasini yaratadi + qaydni 'ishlangan' qiladi."""
+    nid = query.data.split(":", 1)[1]
+    data = await state.get_data()
+    actions = data.get("split_actions") or []
+    if data.get("split_note_id") != nid or not actions:
+        await query.answer("Muddati o'tdi — qaydni qayta oching.", show_alert=True)
+        return
+    note = await database.get_note(nid)
+    base_tags = list((note or {}).get("tags") or []) + [f"note:{nid}"]
+    created = []
+    for a in actions:
+        d = a.get("data") or {}
+        title = (d.get("title") or "").strip()
+        if not title:
+            continue
+        tid = await database.create_task({
+            "title": title[:200], "description": None,
+            "priority": d.get("priority") or "P2", "deadline": d.get("deadline"),
+            "status": "todo", "tags": base_tags, "source": "note",
+        })
+        created.append(tid)
+    if created:
+        await database.mark_note_processed(nid, "task", created[0])
+    await state.update_data(split_note_id=None, split_actions=None)
+    await query.answer(f"✅ {len(created)} ta vazifa yaratildi")
+    try:
+        await query.message.edit_text(
+            f"✅ **{len(created)} ta vazifa yaratildi** _(qayd ishlangan)_\n\n"
+            "Vazifalar bo'limida ko'rishingiz mumkin.",
+            parse_mode="Markdown",
+        )
+    except TelegramBadRequest:
+        pass
+
+
 @router.callback_query(F.data.startswith("noteanalyze:"))
 async def cb_note_analyze(query: CallbackQuery, state: FSMContext) -> None:
     """Send the note content to Claude (fast model) for a 2-line summary +
@@ -4273,12 +5572,12 @@ async def cb_note_analyze(query: CallbackQuery, state: FSMContext) -> None:
     nid = query.data.split(":", 1)[1]
     note = await database.get_note(nid)
     if not note:
-        await query.answer("Note topilmadi", show_alert=True)
+        await query.answer("Qayd topilmadi", show_alert=True)
         return
     await query.answer("🤖 Tahlil qilinmoqda...")
     content = (note.get("content") or "").strip()
     if not content:
-        await query.message.answer("Bo'sh note — tahlil qilish mumkin emas.")
+        await query.message.answer("Bo'sh qayd — tahlil qilish mumkin emas.")
         return
     typing = asyncio.create_task(_keep_typing(query.bot, query.message.chat.id))
     try:
@@ -4425,6 +5724,57 @@ async def cb_reminder_done(query: CallbackQuery) -> None:
             await _safe_answer(query.message, "✅ Eslatma bajarildi.")
 
 
+@router.callback_query(F.data.startswith("remskip:"))
+async def cb_reminder_skip(query: CallbackQuery) -> None:
+    """⏭ Bu safarni o'tkaz — takroriy eslatmani KEYINGI takroriga suradi (bu
+    martagisi bajarilgan hisoblanadi), seriya saqlanadi. Takror bo'lmasa —
+    oddiy 'bajarildi' kabi yopadi."""
+    rid = query.data.split(":", 1)[1]
+    reminder = await database.get_reminder(rid)
+    if not reminder:
+        await query.answer("Eslatma topilmadi", show_alert=True)
+        return
+    rule = database.normalize_recurrence_rule(reminder.get("recurrence_rule"))
+    next_at = database.compute_next_recurrence(reminder.get("remind_at"), rule) if rule else None
+    if next_at:
+        await database.update_reminder(rid, {"remind_at": next_at, "status": "scheduled", "sent_at": None})
+        reminder = await database.get_reminder(rid)
+        await query.answer(f"⏭ O'tkazildi · keyingisi: {_reminder_time_chip(reminder)}")
+        header = "⏭ **KEYINGI TAKRORGA O'TKAZILDI**"
+    else:
+        await database.complete_reminder(rid)
+        reminder = await database.get_reminder(rid)
+        await query.answer("Takror tugadi ✅")
+        header = "✅ **BAJARILDI**"
+    if reminder:
+        try:
+            await query.message.edit_text(
+                header + "\n" + _SEP + "\n\n" + _format_reminder_card(reminder),
+                parse_mode="Markdown", reply_markup=reminder_detail_menu(reminder))
+        except TelegramBadRequest:
+            pass
+
+
+@router.callback_query(F.data.startswith("remstop:"))
+async def cb_reminder_stop(query: CallbackQuery) -> None:
+    """🛑 Takrorni to'xtatish — butun takroriy seriyani tugatadi (status=done,
+    scheduler boshqa ishga tushirmaydi)."""
+    rid = query.data.split(":", 1)[1]
+    ok = await database.complete_reminder(rid)
+    if not ok:
+        await query.answer("Eslatma topilmadi", show_alert=True)
+        return
+    await query.answer("🛑 Takror to'xtatildi")
+    reminder = await database.get_reminder(rid)
+    if reminder:
+        try:
+            await query.message.edit_text(
+                "🛑 **TAKROR TO'XTATILDI**\n" + _SEP + "\n\n" + _format_reminder_card(reminder),
+                parse_mode="Markdown", reply_markup=reminder_detail_menu(reminder))
+        except TelegramBadRequest:
+            pass
+
+
 @router.callback_query(F.data.startswith("remsnooze:"))
 async def cb_reminder_snooze(query: CallbackQuery) -> None:
     parts = query.data.split(":")
@@ -4463,9 +5813,99 @@ async def cb_reminder_delete(query: CallbackQuery) -> None:
         return
     await query.answer("O'chirildi ✅")
     try:
-        await query.message.edit_text("🗑 Eslatma o'chirildi.", reply_markup=single_back_keyboard("remfilter:upcoming", "⬅️ Ro'yxatga"))
+        await query.message.edit_text("🗑 Eslatma o'chirildi.", reply_markup=single_back_keyboard("remfilter:active", "⬅️ Ro'yxatga"))
     except TelegramBadRequest:
         await _safe_answer(query.message, "🗑 Eslatma o'chirildi.")
+
+
+# Takror tahriri uchun pick-list variantlari (val, label).
+_RECUR_OPTIONS = [
+    ("daily", "⏰ Kunlik"),
+    ("weekdays", "📅 Ish kunlari (Dush–Juma)"),
+    ("weekly", "📆 Haftalik"),
+    ("monthly", "🗓 Oylik"),
+    ("quarterly", "📊 Choraklik"),
+    ("yearly", "🎯 Yillik"),
+    ("none", "✖️ Takrorsiz"),
+]
+
+
+@router.callback_query(F.data.startswith("remeditmenu:"))
+async def cb_reminder_edit_menu(query: CallbackQuery) -> None:
+    """✏️ Tahrirlash — konsolidatsiyalangan tahrir submenyusi."""
+    rid = query.data.split(":", 1)[1]
+    reminder = await database.get_reminder(rid)
+    if not reminder:
+        await query.answer("Eslatma topilmadi", show_alert=True)
+        return
+    await query.answer()
+    title = (reminder.get("title") or "Eslatma").strip()[:40]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✏️ Sarlavha", callback_data=f"remedit:{rid}:title"),
+            InlineKeyboardButton(text="🕐 Vaqt", callback_data=f"remedit:{rid}:time"),
+        ],
+        [
+            InlineKeyboardButton(text="🔁 Takror", callback_data=f"remrecurmenu:{rid}"),
+            InlineKeyboardButton(text="📝 Izoh", callback_data=f"remedit:{rid}:note"),
+        ],
+        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"remopen:{rid}")],
+    ])
+    text = (f"✏️ **TAHRIRLASH**\n{_SEP}\n\n«{_escape_markdown(title)}»\n\n"
+            "Qaysi maydonni o'zgartiramiz?")
+    try:
+        await query.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+    except TelegramBadRequest:
+        await _safe_answer(query.message, text, parse_mode="Markdown", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("remrecurmenu:"))
+async def cb_reminder_recurrence_menu(query: CallbackQuery) -> None:
+    """🔁 Takror — takrorlash qoidasini pick-list bilan o'zgartirish."""
+    rid = query.data.split(":", 1)[1]
+    reminder = await database.get_reminder(rid)
+    if not reminder:
+        await query.answer("Eslatma topilmadi", show_alert=True)
+        return
+    await query.answer()
+    cur = database.normalize_recurrence_rule(reminder.get("recurrence_rule"))
+    rows = []
+    for val, label in _RECUR_OPTIONS:
+        mark = " ✅" if (cur == val or (val == "none" and not cur)) else ""
+        rows.append([InlineKeyboardButton(text=label + mark, callback_data=f"remrecur:{rid}:{val}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"remeditmenu:{rid}")])
+    cur_label = _format_recurrence_label(cur) if cur else "takrorsiz"
+    text = (f"🔁 **TAKROR**\n{_SEP}\n\nHozir: **{cur_label}**\n\n"
+            "Yangi takrorlash qoidasini tanlang:")
+    try:
+        await query.message.edit_text(text, parse_mode="Markdown",
+                                       reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    except TelegramBadRequest:
+        await _safe_answer(query.message, text, parse_mode="Markdown",
+                           reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("remrecur:"))
+async def cb_reminder_set_recurrence(query: CallbackQuery) -> None:
+    """Takror qoidasini o'rnatadi (yoki takrorsiz qiladi)."""
+    parts = query.data.split(":")
+    if len(parts) < 3:
+        await query.answer("Xato format", show_alert=True)
+        return
+    rid, val = parts[1], parts[2]
+    rule = None if val == "none" else database.normalize_recurrence_rule(val)
+    ok = await database.update_reminder(rid, {"recurrence_rule": rule})
+    if not ok:
+        await query.answer("Eslatma topilmadi", show_alert=True)
+        return
+    reminder = await database.get_reminder(rid)
+    await query.answer(f"🔁 Takror: {_format_recurrence_label(rule) if rule else 'takrorsiz'}")
+    try:
+        await query.message.edit_text(
+            "✅ Saqlandi\n" + _SEP + "\n\n" + _format_reminder_card(reminder),
+            parse_mode="Markdown", reply_markup=reminder_detail_menu(reminder))
+    except TelegramBadRequest:
+        pass
 
 
 @router.callback_query(F.data.startswith("remedit:"))
@@ -4479,17 +5919,19 @@ async def cb_reminder_edit(query: CallbackQuery, state: FSMContext) -> None:
     if not reminder:
         await query.answer("Eslatma topilmadi", show_alert=True)
         return
-    if field not in {"title", "time"}:
+    if field not in {"title", "time", "note"}:
         await query.answer("Maydon noma'lum", show_alert=True)
         return
     await state.set_state(ReminderEditFSM.awaiting_value)
     await state.update_data(reminder_id=rid, field=field)
     await query.answer()
     if field == "title":
-        prompt = "✏️ **Eslatma matni**\n\nYangi matnni yuboring."
+        prompt = "✏️ **Eslatma sarlavhasi**\n\nYangi sarlavhani yuboring (matn yoki ovoz)."
+    elif field == "note":
+        prompt = "📝 **Eslatma izohi**\n\nYangi izoh (tavsif) matnini yuboring. `-` = tozalash."
     else:
         prompt = (
-            "📆 **Eslatma vaqti**\n\n"
+            "🕐 **Eslatma vaqti**\n\n"
             "Yangi vaqtni yuboring: `bugun 17:00`, `ertaga 09:00`, `2 soat`."
         )
     await _safe_answer(
@@ -4510,8 +5952,11 @@ async def handle_reminder_edit_value(message: Message, state: FSMContext) -> Non
     rid = data.get("reminder_id")
     field = data.get("field")
     await state.clear()
-    raw = (message.text or "").strip()
-    if not rid or field not in {"title", "time"}:
+    # BUG FIX: ovoz xabarda message.text=None bo'ladi — transkripsiya _msg_text'da.
+    # Avval message.text ishlatilgan edi → ovoz orqali tahrir "bo'sh qiymat" deb
+    # ishlamasdi. Endi har ikki holatda ham _get_text_or_transcribe natijasidan olamiz.
+    raw = (_msg_text or "").strip()
+    if not rid or field not in {"title", "time", "note"}:
         await message.answer("Holat yo'qoldi — qayta urinib ko'ring.")
         return
     if not raw:
@@ -4519,6 +5964,9 @@ async def handle_reminder_edit_value(message: Message, state: FSMContext) -> Non
         return
     if field == "title":
         ok = await database.update_reminder(rid, {"title": raw[:220]})
+    elif field == "note":
+        # '-' → izohni tozalash
+        ok = await database.update_reminder(rid, {"note": None if raw == "-" else raw[:1000]})
     else:
         parsed, reason = await _parse_deadline_natural(raw)
         if not parsed:
@@ -4916,6 +6364,73 @@ async def cmd_meetings(message: Message, state: FSMContext | None = None) -> Non
     await _render_meetings_for_filter(message, filt="week")
 
 
+def _looks_like_protocol(fu) -> bool:
+    """Distinguish a saved bayonnoma (long prose) from the task-id list that the
+    post-meeting follow-up flow also stores in `follow_up_actions`."""
+    if isinstance(fu, str):
+        s = fu.strip()
+    elif isinstance(fu, list) and fu:
+        s = str(fu[0]).strip()
+    else:
+        return False
+    return len(s) > 40 and (" " in s)
+
+
+async def _render_protocols(message: Message) -> None:
+    """Markaziy 'Bayonnomalar' ro'yxati — barcha bayonnomali uchrashuvlar, OY
+    bo'yicha guruhlangan, yangi birinchi. Raqamni bosish → to'liq protokol
+    (mavjud viewproto: matn + 📄 Word + 📤 Ulashish)."""
+    candidates = await database.list_meetings_with_protocol(limit=100)
+    meetings = [m for m in candidates if _looks_like_protocol(m.get("follow_up_actions"))]
+    if not meetings:
+        await _safe_answer(
+            message,
+            "📄 **BAYONNOMALAR**\n\n_Hozircha saqlangan bayonnoma yo'q._\n\n"
+            "Uchrashuvni oching → 📄 Bayonnoma yarating → ✅ Saqlang.",
+            parse_mode="Markdown",
+        )
+        return
+    DIV = "━" * 15
+    MAX = 25
+    shown = meetings[:MAX]
+    lines = [f"📄 **BAYONNOMALAR · {len(meetings)} ta**", "", DIV]
+    cur_key = None
+    nums: list[tuple[int, str]] = []
+    for i, m in enumerate(shown, 1):
+        try:
+            dt = datetime.fromisoformat(m["datetime_start"]).astimezone(database.TZ)
+            mkey = (dt.year, dt.month)
+            mlabel = f"{UZ_MONTHS_FULL[dt.month - 1].upper()} {dt.year}"
+            day = f"{dt.day}-{UZ_MONTHS_FULL[dt.month - 1]}"
+        except (ValueError, TypeError, KeyError):
+            mkey, mlabel, day = (0, 0), "SANASIZ", "—"
+        if mkey != cur_key:
+            lines.append("")
+            lines.append(f"📅 **{mlabel}**")
+            cur_key = mkey
+        title = (m.get("title") or "Uchrashuv").strip()
+        npart = len(m.get("participants") or [])
+        part = f" · 👥 {npart}" if npart else ""
+        lines.append(f"  {i}. {_escape_markdown(title[:50])} — {day}{part}")
+        nums.append((i, m["id"]))
+    if len(meetings) > MAX:
+        lines.append("")
+        lines.append(f"_+{len(meetings) - MAX} ta yana_")
+    lines.extend(["", DIV, "Raqamni bosing — to'liq bayonnoma + 📄 Word"])
+    btns = [InlineKeyboardButton(text=str(i), callback_data=f"viewproto:{mid}") for i, mid in nums]
+    rows = [btns[j:j + 5] for j in range(0, len(btns), 5)]
+    rows.append([back_button("meetingfilter:week", "⬅️ Uchrashuvlar")])
+    await _safe_answer(message, "\n".join(lines), parse_mode="Markdown",
+                       reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.message(Command("bayonnomalar"))
+@router.message(Command("protocols"))
+async def cmd_protocols(message: Message) -> None:
+    """/bayonnomalar — barcha saqlangan bayonnomalar markaziy ro'yxati (oy bo'yicha)."""
+    await _render_protocols(message)
+
+
 @router.callback_query(F.data.startswith("meetingfilter:"))
 async def cb_meeting_filter(query: CallbackQuery) -> None:
     parts = query.data.split(":")
@@ -5279,7 +6794,7 @@ def _format_stats_dashboard(stats: dict, label: str) -> str:
 
     lines.extend([
         "",
-        "👥 **Delegatsiya**",
+        "📋 **Delegatsiya**",
     ])
     if stats["delegation"]:
         for row in stats["delegation"][:4]:
@@ -5365,7 +6880,7 @@ def _format_executive_report(stats: dict, label: str) -> str:
 
     # Delegation
     if stats.get("delegation"):
-        section = ["👥 **Delegatsiya**", ""]
+        section = ["📋 **Delegatsiya**", ""]
         for row in stats["delegation"][:4]:
             section.append(f"• {row['assignee']}: **{row['total']}** ochiq · **{row['overdue'] or 0}** o'tgan")
         blocks.append("\n".join(section))
@@ -7790,12 +9305,16 @@ async def cmd_cockpit(message: Message, state: FSMContext | None = None) -> None
     try:
         signals = await _cockpit_compute_signals(now)
         text = _build_cockpit_panel(signals)
+        # B5: qayta ishlanmagan qaydlar sonini yuzaga chiqaramiz (GTD turtki)
+        inbox_n = await database.count_notes_in_status("inbox")
     finally:
         typing_task.cancel()
 
     # Inline kbd with drill-down rows so users can jump straight from the
-    # cockpit into the underlying panels (team, risks, stats, delegations)
-    # without leaving and finding the section buttons in the main keyboard.
+    # cockpit into the underlying panels (team, risks, stats, qaydlar) without
+    # leaving and finding the section buttons in the main keyboard. (Delegatsiya
+    # trekeri endi Ijrochilar paneli ichida — "⏳ Kutilayotganlar" tugmasi.)
+    notes_label = f"📝 Qaydlar ({inbox_n})" if inbox_n else "📝 Qaydlar"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="👥 Ijrochilar", callback_data="cockpit_team"),
@@ -7803,7 +9322,7 @@ async def cmd_cockpit(message: Message, state: FSMContext | None = None) -> None
         ],
         [
             InlineKeyboardButton(text="📊 Statistika", callback_data="cockpit_stats"),
-            InlineKeyboardButton(text="📋 Delegatsiyalar", callback_data="cockpit_delegations"),
+            InlineKeyboardButton(text=notes_label, callback_data="nav_notes"),
         ],
         [InlineKeyboardButton(text="🔄 Yangilash", callback_data="cockpit_refresh")],
     ])
@@ -7846,12 +9365,6 @@ async def cb_cockpit_stats(query: CallbackQuery) -> None:
         parse_mode="Markdown",
         reply_markup=_stats_period_keyboard(days),
     )
-
-
-@router.callback_query(F.data == "cockpit_delegations")
-async def cb_cockpit_delegations(query: CallbackQuery) -> None:
-    await query.answer()
-    await cmd_delegations(query.message)
 
 
 # ─────────────────────── MESSAGE HANDLERS ───────────────────────
@@ -7979,6 +9492,22 @@ def _forward_signal(message: Message) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _forward_is_bot_echo(message: Message) -> bool:
+    """True if the forward originates from a bot (often THIS bot) — i.e. the user
+    forwarded bot output back to it. That's not external info worth capturing as
+    a note (reported: bot's own '📌 VAZIFALAR' panel saved as a forward note)."""
+    bot_id = getattr(getattr(message, "bot", None), "id", None)
+    origin = getattr(message, "forward_origin", None)
+    for u in (getattr(origin, "sender_user", None), getattr(message, "forward_from", None)):
+        if u is None:
+            continue
+        if getattr(u, "is_bot", False):
+            return True
+        if bot_id and getattr(u, "id", None) == bot_id:
+            return True
+    return False
+
+
 @router.message(
     # A forward is an explicit "save this" gesture — capture it as a note in the
     # default chat AND while browsing any section. Previously this was
@@ -8006,8 +9535,13 @@ async def handle_forwarded_message(message: Message, state: FSMContext) -> None:
     content = (message.text or message.caption or "").strip()
     if not content:
         await message.answer(
-            "📎 Bo'sh forward — note yaratilmadi. Matn yoki izoh bo'lgan xabarni forward qiling."
+            "📎 Bo'sh forward — qayd yaratilmadi. Matn yoki izoh bo'lgan xabarni forward qiling."
         )
+        return
+    # Bot'ning o'z chiqishi / tugma / buyruq forward qilinsa — qayd yaratmaymiz
+    # (reported: '📌 VAZIFALAR' paneli, '⬅️ Asosiy menyu' tugmasi qayd bo'lib qolgan).
+    if _forward_is_bot_echo(message) or _looks_like_bot_output(content) or _is_note_noise(content):
+        await message.answer("↩️ Bu botning o'z xabari yoki tugma matni — qayd yaratilmadi.")
         return
     # html_text preserves Telegram entities (bold, italic, code, links) as HTML
     # tags. Used by _format_note_detail to render the forwarded text inside a
@@ -8102,6 +9636,59 @@ async def cb_voice_cancel(query: CallbackQuery, state: FSMContext) -> None:
         pass
 
 
+# Data safety: snapshots taken right before a bulk delete, keyed by the
+# confirm message_id so the "↩️ Qaytarish" button can restore them.
+_UNDO_BACKUPS: dict[str, str] = {}
+
+
+async def _create_db_backup(tag: str) -> str:
+    """Consistent SQLite snapshot via the .backup API (safe while writing).
+    Returns the backup file path under data/backups/."""
+    import sqlite3
+    ts = datetime.now(database.TZ).strftime("%Y%m%d-%H%M%S")
+    backup_dir = Path(config.DATABASE_PATH).parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    path = str(backup_dir / f"yordamchi-{tag}-{ts}.db")
+
+    def _do() -> None:
+        with sqlite3.connect(config.DATABASE_PATH) as src, sqlite3.connect(path) as dst:
+            src.backup(dst)
+
+    await asyncio.to_thread(_do)
+    return path
+
+
+@router.callback_query(F.data.startswith("undodelete:"))
+async def cb_undo_delete(query: CallbackQuery) -> None:
+    """'↩️ Qaytarish' — restore the pre-delete snapshot over the live DB. Safe
+    immediately after a bulk delete (no intervening writes); uses the .backup
+    API in reverse so WAL is handled correctly."""
+    token = query.data.split(":", 1)[1]
+    path = _UNDO_BACKUPS.get(token)
+    if not path or not Path(path).exists():
+        await query.answer("Qaytarish muddati o'tdi — backup topilmadi.", show_alert=True)
+        return
+    await query.answer("↩️ Tiklanmoqda…")
+    import sqlite3
+
+    def _restore() -> None:
+        with sqlite3.connect(path) as src, sqlite3.connect(config.DATABASE_PATH) as dst:
+            src.backup(dst)
+
+    try:
+        await asyncio.to_thread(_restore)
+    except Exception as e:
+        await query.message.answer(_humanize_error(e))
+        return
+    _UNDO_BACKUPS.pop(token, None)
+    try:
+        await query.message.edit_text(
+            "↩️ **Tiklandi** — o'chirilgan ma'lumotlar qaytarildi.",
+            parse_mode="Markdown")
+    except TelegramBadRequest:
+        pass
+
+
 @router.callback_query(F.data == "acts_confirm")
 async def cb_actions_confirm(query: CallbackQuery, state: FSMContext) -> None:
     """User tapped ✅ on a create-action preview — execute the deferred Claude
@@ -8122,8 +9709,18 @@ async def cb_actions_confirm(query: CallbackQuery, state: FSMContext) -> None:
         await query.message.edit_reply_markup(reply_markup=None)
     except TelegramBadRequest:
         pass
+    actions = response.get("actions", [])
+    # Data safety: snapshot the DB before any irreversible bulk delete so we can
+    # offer one-tap "↩️ Qaytarish". Failure to back up never blocks the delete.
+    undo_token = None
+    if any(a.get("type") in _BULK_DELETE_ACTION_TYPES for a in actions):
+        try:
+            _UNDO_BACKUPS[str(query.message.message_id)] = await _create_db_backup("pre-delete")
+            undo_token = str(query.message.message_id)
+        except Exception:
+            logger.exception("Pre-delete backup failed (continuing without undo)")
     try:
-        ids_by_type = await _execute_actions(response.get("actions", []))
+        ids_by_type = await _execute_actions(actions)
     except Exception as e:
         logger.exception("Deferred _execute_actions failed after confirm")
         await query.message.answer(_humanize_error(e))
@@ -8137,9 +9734,18 @@ async def cb_actions_confirm(query: CallbackQuery, state: FSMContext) -> None:
                 except Exception:
                     logger.debug("mark_note_processed failed for %s", note_id)
                 break
-    keyboard = _build_keyboard(response.get("buttons", []), ids_by_type)
+    keyboard = _build_keyboard(response.get("buttons", []), ids_by_type,
+                               share_text=response.get("user_message"))
     if keyboard:
         keyboard = _append_back_row(keyboard)
+    # Surface one-tap undo right after a bulk delete (snapshot taken above).
+    if undo_token:
+        undo_row = [InlineKeyboardButton(text="↩️ Qaytarish",
+                                         callback_data=f"undodelete:{undo_token}")]
+        if keyboard:
+            keyboard.inline_keyboard.insert(0, undo_row)
+        else:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[undo_row])
     text = (response.get("user_message") or "").strip() or "✅ Yaratildi"
     text += _failed_actions_note(ids_by_type)
     await _safe_answer(query.message, text,
@@ -8216,18 +9822,7 @@ def _extract_polished_body(message: Message) -> str:
     """Pull just the polished letter out of a 'Tahrirlangan matn:' card —
     header line and ─── rules stripped — so it can be re-sent clean."""
     raw = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
-    out: list[str] = []
-    for ln in raw.split("\n"):
-        s = ln.strip()
-        if not s:
-            out.append("")
-            continue
-        if "Tahrirlangan matn" in s or "Tahrirlangan xat" in s:
-            continue
-        if set(s) <= set("─—-_=•· "):  # a line made only of rule/bullet chars
-            continue
-        out.append(ln)
-    return "\n".join(out).strip()
+    return _strip_polish_wrapper(raw)
 
 
 @router.callback_query(F.data == "copy")
@@ -8353,7 +9948,8 @@ async def _restore_main_keyboard(message: Message) -> None:
 async def handle_main_reply_button(message: Message, state: FSMContext) -> None:
     """Asosiy menyu reply tugmalari — har qanday holatda ishlasin
     (section'dan chiqib boshqa bo'limga o'tish uchun)."""
-    label = message.text.strip()
+    _msg_text = message.text  # matn-only handler; section handlerlari bilan bir xil nom
+    label = _msg_text.strip()
     current = await state.get_state()
     if current is not None:
         await state.clear()
@@ -8395,9 +9991,12 @@ async def handle_tasks_section_button(message: Message, state: FSMContext) -> No
         return
 
     """Vazifalar bo'limidagi reply tugmalari (state == in_tasks)."""
-    label = message.text.strip()
+    label = _msg_text.strip()
     if label in _TASKS_SECTION_FILTERS:
         await _render_tasks_for_filter(message, _TASKS_SECTION_FILTERS[label])
+        return
+    if label == TBTN_TASKS_CATEGORIES:
+        await _render_categories(message)
         return
     if label == TBTN_TASKS_NEW:
         await _safe_answer(
@@ -8419,7 +10018,16 @@ async def handle_tasks_section_button(message: Message, state: FSMContext) -> No
         )
         return
     # Boshqa matn — Claude'ga yuborish (section state'da ham erkin xabar mumkin)
-    await _process_and_reply(message, message.text, state=state)
+    await _process_and_reply(message, _msg_text, state=state)
+
+
+@router.message(F.text.func(lambda t: bool(t) and t.strip() in _REMINDERS_SECTION_FILTERS))
+async def handle_reminder_filter_anystate(message: Message, state: FSMContext) -> None:
+    """Eslatma filtr tugmasi (⏰ Bugun / 📤 Yuborilgan / 📋 Barchasi) HAR QANDAY
+    holatda FAQAT eslatmalarni ko'rsatadi. FSM state yo'qolsa (TTL/navigatsiya)
+    ham Claude'ga tushib 'Bugun → bugungi vazifalar' bo'lib ketmaydi (reported)."""
+    await state.set_state(SectionFSM.in_reminders)
+    await _render_reminders_for_filter(message, _REMINDERS_SECTION_FILTERS[message.text.strip()])
 
 
 @router.message(StateFilter(SectionFSM.in_reminders), F.text | F.voice)
@@ -8429,7 +10037,7 @@ async def handle_reminders_section_button(message: Message, state: FSMContext) -
         return
 
     """Eslatmalar bo'limidagi reply tugmalari."""
-    label = message.text.strip()
+    label = _msg_text.strip()
     if label in _REMINDERS_SECTION_FILTERS:
         await _render_reminders_for_filter(message, _REMINDERS_SECTION_FILTERS[label])
         return
@@ -8444,7 +10052,7 @@ async def handle_reminders_section_button(message: Message, state: FSMContext) -
             parse_mode="Markdown",
         )
         return
-    await _process_and_reply(message, message.text, state=state)
+    await _process_and_reply(message, _msg_text, state=state)
 
 
 @router.message(StateFilter(SectionFSM.in_meetings), F.text | F.voice)
@@ -8454,7 +10062,7 @@ async def handle_meetings_section_button(message: Message, state: FSMContext) ->
         return
 
     """Uchrashuvlar bo'limidagi reply tugmalari (state == in_meetings)."""
-    label = message.text.strip()
+    label = _msg_text.strip()
     if label in _MEETINGS_SECTION_FILTERS:
         await _render_meetings_for_filter(message, _MEETINGS_SECTION_FILTERS[label])
         return
@@ -8468,7 +10076,9 @@ async def handle_meetings_section_button(message: Message, state: FSMContext) ->
         return
     if label == MBTN_MEETINGS_SEARCH:
         await cmd_search(message); return
-    await _process_and_reply(message, message.text, state=state)
+    if label == MBTN_MEETINGS_PROTOCOLS:
+        await _render_protocols(message); return
+    await _process_and_reply(message, _msg_text, state=state)
 
 
 @router.message(StateFilter(SectionFSM.in_stats), F.text | F.voice)
@@ -8478,7 +10088,7 @@ async def handle_stats_section_button(message: Message, state: FSMContext) -> No
         return
 
     """Statistika bo'limidagi reply tugmalari (state == in_stats)."""
-    label = message.text.strip()
+    label = _msg_text.strip()
     if label in _STATS_SECTION_PERIODS:
         days = _STATS_SECTION_PERIODS[label]
         stats = await database.executive_stats(days=days)
@@ -8498,7 +10108,7 @@ async def handle_stats_section_button(message: Message, state: FSMContext) -> No
         await _safe_answer(message, _format_executive_report(stats, "Oxirgi 30 kun"),
                             parse_mode="Markdown", reply_markup=_report_keyboard(30))
         return
-    await _process_and_reply(message, message.text, state=state)
+    await _process_and_reply(message, _msg_text, state=state)
 
 
 @router.message(StateFilter(SectionFSM.in_team), F.text | F.voice)
@@ -8508,9 +10118,11 @@ async def handle_team_section_button(message: Message, state: FSMContext) -> Non
         return
 
     """Ijrochilar bo'limidagi reply tugmalari (state == in_team)."""
-    label = message.text.strip()
+    label = _msg_text.strip()
     if label == YBTN_TEAM_REFRESH:
         await _render_team_panel(message); return
+    if label == YBTN_TEAM_STALE:
+        await _render_stale_delegations(message); return
     if label == YBTN_TEAM_UNASSIGNED:
         tasks = await database.list_unassigned_tasks(limit=50)
         text = _format_tasks_compact(tasks, "Ijrochisiz vazifalar")
@@ -8526,7 +10138,7 @@ async def handle_team_section_button(message: Message, state: FSMContext) -> Non
             parse_mode="Markdown",
         )
         return
-    await _process_and_reply(message, message.text, state=state)
+    await _process_and_reply(message, _msg_text, state=state)
 
 
 @router.message(StateFilter(SectionFSM.in_risks), F.text | F.voice)
@@ -8536,10 +10148,10 @@ async def handle_risks_section_button(message: Message, state: FSMContext) -> No
         return
 
     """Risklar bo'limidagi reply tugmalari (state == in_risks)."""
-    label = message.text.strip()
+    label = _msg_text.strip()
     if label == RBTN_RISKS_REFRESH:
         await _render_risks_panel(message); return
-    await _process_and_reply(message, message.text, state=state)
+    await _process_and_reply(message, _msg_text, state=state)
 
 
 @router.message(StateFilter(SectionFSM.in_today), F.text | F.voice)
@@ -8549,7 +10161,7 @@ async def handle_today_section_button(message: Message, state: FSMContext) -> No
         return
 
     """Bugun bo'limidagi reply tugmalari (state == in_today)."""
-    label = message.text.strip()
+    label = _msg_text.strip()
     if label == DBTN_TODAY_EVENING:
         # Re-use cb_today_evening logic without callback object
         typing_task = asyncio.create_task(_keep_typing(message.bot, message.chat.id))
@@ -8577,7 +10189,7 @@ async def handle_today_section_button(message: Message, state: FSMContext) -> No
         return
     if label == DBTN_TODAY_MEETINGS:
         await cmd_meetings(message, state); return
-    await _process_and_reply(message, message.text, state=state)
+    await _process_and_reply(message, _msg_text, state=state)
 
 
 @router.message(StateFilter(SectionFSM.in_new), F.text | F.voice)
@@ -8587,7 +10199,7 @@ async def handle_new_section_button(message: Message, state: FSMContext) -> None
         return
 
     """Yangi bo'limidagi reply tugmalari (state == in_new)."""
-    label = message.text.strip()
+    label = _msg_text.strip()
     prompts = {
         NBTN_NEW_TASK: ("📝 **YANGI VAZIFA**\n\nMatn yoki ovoz yuboring. Misol:\n"
                         "_\"Ertaga ertalab Aziz akaga marketing hisoboti\"_"),
@@ -8614,7 +10226,7 @@ async def handle_new_section_button(message: Message, state: FSMContext) -> None
     if label in prompts:
         await _safe_answer(message, prompts[label], parse_mode="Markdown")
         return
-    await _process_and_reply(message, message.text, state=state)
+    await _process_and_reply(message, _msg_text, state=state)
 
 
 @router.message(StateFilter(SectionFSM.in_search), F.text | F.voice)
@@ -8626,7 +10238,7 @@ async def handle_search_section_button(message: Message, state: FSMContext) -> N
     """Qidiruv bo'limidagi reply tugmalari (state == in_search).
     Scope tugmasi tanlanmasa, matn to'g'ridan-to'g'ri qidiruv so'zi sifatida ishlatiladi.
     """
-    label = message.text.strip()
+    label = _msg_text.strip()
     scope_map = {
         QBTN_SEARCH_TASKS:    "tasks",
         QBTN_SEARCH_MEETINGS: "meetings",
@@ -8673,12 +10285,12 @@ async def handle_search_section_button(message: Message, state: FSMContext) -> N
 @router.message(StateFilter(SectionFSM.in_notes), F.text | F.voice)
 async def handle_notes_section_button(message: Message, state: FSMContext) -> None:
     """Reply-keyboard tugmalari Qaydlar bo'limida. Inbox/Ishlangan/Arxiv —
-    filter; '➕ Yangi note' → one-shot capture FSM; '🔍 Qidirish' → search
+    filter; '➕ Yangi qayd' → one-shot capture FSM; '🔍 Qidirish' → search
     flow; matn fall-through Claude'ga, voice ham."""
     _msg_text = await _get_text_or_transcribe(message, bot=message.bot)
     if _msg_text is None:
         return
-    label = message.text.strip()
+    label = _msg_text.strip()
     if label in _NOTES_SECTION_FILTERS:
         await _render_notes_for_filter(message, _NOTES_SECTION_FILTERS[label])
         return
@@ -8703,7 +10315,7 @@ async def handle_notes_section_button(message: Message, state: FSMContext) -> No
         )
         return
     # Fall-through: free text/voice → Claude (might create a note via LLM).
-    await _process_and_reply(message, message.text, state=state)
+    await _process_and_reply(message, _msg_text, state=state)
 
 
 @router.message(StateFilter(SectionFSM.in_settings), F.text | F.voice)
@@ -8807,7 +10419,8 @@ async def handle_text(message: Message, state: FSMContext) -> None:
     o'sha state'ning maxsus handler'i tomonidan qabul qilinadi."""
     if message.text.startswith("/"):
         return
-    await _process_and_reply(message, message.text, state=state)
+    _msg_text = message.text
+    await _process_and_reply(message, _msg_text, state=state)
 
 
 # ─────────────────────── CALLBACK HANDLERS ───────────────────────
@@ -9596,7 +11209,10 @@ def _build_protocol_directive(meeting: dict, user_notes: str) -> str:
 
     return (
         "[INTERNAL] generate_meeting_protocol\n\n"
-        "Sen rasmiy uzbek tilidagi uchrashuv bayonnomasini tuzasan.\n\n"
+        "Sen rasmiy bayonnoma MUHARRIRISAN, muallif EMAS. Foydalanuvchi bergan "
+        "qaydlarni rasmiy, professional o'zbek uslubiga keltirasan — XOLOS. Yangi "
+        "muhokama tafsiloti, qaror, topshiriq, ishtirokchi yoki lavozim O'YLAB TOPMA. "
+        "Faqat berilgan qaydlar + uchrashuv metadata'sidan foydalan.\n\n"
         "UCHRASHUV MA'LUMOTLARI:\n"
         f"  Mavzu: {meeting.get('title') or '—'}\n"
         f"  Sana: {date_str}\n"
@@ -9604,36 +11220,275 @@ def _build_protocol_directive(meeting: dict, user_notes: str) -> str:
         f"  Joy: {location}\n"
         f"  Ishtirokchilar: {participants}\n"
         f"  Kun tartibi: {agenda}\n\n"
-        f"FOYDALANUVCHI YOZUVI:\n{user_notes}\n\n"
-        "VAZIFA:\n"
-        "JSON envelope qaytar. `user_message` ichida rasmiy uzbek tilida tuzilgan "
-        "to'liq bayonnomani markdown formatda joylab ber. Quyidagi tartibni saqla:\n\n"
-        "📝 **UCHRASHUV BAYONNOMASI**\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📅 **Sana va vaqt**\n{sana, vaqt diapazoni}\n\n"
-        "📍 **O'tkazilgan joy**\n{joy}\n\n"
-        "👥 **Ishtirokchilar**\n1. {Familiya Ism otasining ismi}, {lavozim}\n2. ...\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📋 **KUN TARTIBI**\n1. {mavzu}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "💬 **MUHOKAMA**\n{Har mavzu bo'yicha 2-4 gap rasmiy uslubda.}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "✅ **QABUL QILINGAN QARORLAR**\n1. {Qaror buyruq fe'li bilan: '...sin'.}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📌 **TOPSHIRIQLAR**\n1. {Topshiriq matni}\n   Mas'ul: {ism}\n   Muddat: {sana}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "_Bayonnoma Maqsud Rustamov tomonidan tasdiqlandi._\n\n"
-        "USLUB QOIDALARI:\n"
-        "- Faol nisbat ('tayyorlang' emas 'tayyorlanishi kerak')\n"
-        "- Ismlar to'liq, lavozimlar bilan\n"
-        "- Hissiy so'zlar yo'q ('juda muhim' — yo'q, aniq sana — ha)\n"
-        "- Qarorlar buyruq fe'li bilan tugasin ('...sin')\n"
-        "- Foydalanuvchi yozuvida ma'lumot yo'q bo'lsa, mavjud metadata'dan foydalan, "
-        "to'qib chiqarma. Yo'q narsani '[aniqlashtirish kerak]' deb belgila.\n\n"
-        "TOPSHIRIQLAR uchun `actions` maydoniga create_task elementlarini joyla. "
-        "Har bir create_task data: {title, assignee, deadline (ISO 8601 yoki null), priority='P1'}. "
-        "Foydalanuvchi yozuvida aniq topshiriq yo'q bo'lsa, `actions: []` qaytar."
+        f"FOYDALANUVCHI QAYDLARI (yagona mazmun manbai):\n{user_notes}\n\n"
+        "1-QADAM — USLUBNI TANLA (uchrashuv mavzusi va qaydlar ohangiga qarab):\n"
+        "  A) RASMIY — kengash, hay'at, vazirlik/rasmiy muzokara, qaror qabul "
+        "qiluvchi yig'ilish. To'liq formal: har masala bo'yicha 'ESHITILDI:' va "
+        "'QAROR QILINDI:' (qarorlar raqamli — 1.1, 1.2); oxirida 'Rais: … · Kotib: …'.\n"
+        "  B) ISHCHI (STANDART) — jamoa yig'ilishi, loyiha/operatsion muhokama. "
+        "Har mavzu BITTA blok: 🔹 Eshitildi (qisqa) → ✅ Qaror → 📌 Topshiriq.\n"
+        "  C) QISQA — 1:1, tezkor sync, qisqa muloqot. Muhokamasiz: faqat "
+        "✅ **QARORLAR** va 📌 **TOPSHIRIQLAR** ro'yxati.\n"
+        "  Aniq belgilanmasa — B ni tanla.\n\n"
+        "2-QADAM — BAYONNOMANI YOZ (markdown). Doimiy sarlavha (ma'lumot bo'lmagan "
+        "qatorni TASHLA, placeholder qo'yma):\n"
+        "📝 **UCHRASHUV BAYONNOMASI**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📅 **Sana va vaqt** — metadata'dan\n"
+        "📍 **Joy** — bo'lsa (yo'q bo'lsa qatorni tashla)\n"
+        "👥 **Ishtirokchilar** — faqat berilgan ismlar (lavozim yo'q bo'lsa — faqat ism)\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📋 **KUN TARTIBI** — mavzular ro'yxati\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "ASOSIY QISM — tanlangan uslub (A/B/C) tuzilmasida.\n\n"
+        "QAT'IY QOIDALAR (eng muhim):\n"
+        "- HECH NARSA QO'SHMA — qaydда yo'q bo'lsa, bayonnomada ham bo'lmaydi.\n"
+        "- Eshitildi/Muhokama — faqat aytilgani, qisqa; tasvirlanmagan bo'lsa tashla. "
+        "Tafsilot O'YLAB TOPMA.\n"
+        "- Noma'lum maydon (joy/lavozim/mas'ul/muddat) — tashlab ket, "
+        "'[aniqlashtirish kerak]' kabi placeholder YOZMA.\n"
+        "- Uslub doimo RASMIY: faol nisbat, hissiy so'zsiz, aniq sanalar. Qarorlar "
+        "buyruq fe'li bilan ('...sin'). Mazmun — foydalanuvchiniki; uslub — rasmiy.\n\n"
+        "TOPSHIRIQLAR uchun `actions` ga create_task joyla (title, assignee, "
+        "deadline ISO 8601 yoki null, priority='P1'). Qaydда aniq topshiriq yo'q "
+        "bo'lsa actions: []. Qaror yoki uchrashuvни topshiriq qilib QO'SHMA."
     )
+
+
+def _protocol_result_kb(mid: str, n_pending: int, saved: bool = False, tasks_done: bool = False) -> InlineKeyboardMarkup:
+    """Buttons under a generated protocol. Saving the bayonnoma and creating tasks
+    are DECOUPLED — each is its own button and disappears once done."""
+    rows: list = []
+    first = []
+    if not saved:
+        first.append(InlineKeyboardButton(text="✅ Bayonnomani saqlash", callback_data=f"proto_ok:{mid}"))
+    if n_pending and not tasks_done:
+        first.append(InlineKeyboardButton(text=f"📌 Vazifalarni qo'shish ({n_pending})",
+                                          callback_data=f"proto_tasks:{mid}"))
+    if first:
+        rows.append(first)
+    rows.append([
+        InlineKeyboardButton(text="✏️ Tahrirlash", callback_data=f"proto_edit:{mid}"),
+        InlineKeyboardButton(text="📄 Word", callback_data=f"proto_export:{mid}"),
+        InlineKeyboardButton(text="📋 Nusxa", callback_data=f"proto_share:{mid}"),
+        InlineKeyboardButton(text="📤 Ulashish", switch_inline_query=f"proto:{mid}"),
+    ])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"meetingopen:{mid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ─── Rasmiy bayonnoma Word dizayni (foydalanuvchi variant-2 namunasi) ───
+# Arial 13pt, justify, 6pt oraliq, A4. Rang-kodli: yorliq/sarlavha/QAROR yashil,
+# ESHITILDI o'rta yashil, TOPSHIRIQ oltin, Izoh qizil. Topshiriqlar — jadval.
+_PROTO_EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF☀-➿←-⇿⬀-⯿️⃣]")
+_PROTO_GREEN = "0B6B36"   # to'q yashil — yorliqlar, sarlavhalar, QAROR
+_PROTO_GREEN2 = "1A8B4D"  # o'rta yashil — ESHITILDI
+_PROTO_AMBER = "B8860B"   # oltin — TOPSHIRIQ
+_PROTO_RED = "EE0000"     # qizil — Izoh
+_PROTO_META_LABELS = ("sana va vaqt", "sana", "vaqt", "joy", "ishtirokchilar",
+                      "bayonnoma yurituvchi", "kotib", "rais", "mavzu", "o'rin")
+_PROTO_SECTION_HEADERS = ("KUN TARTIBI", "QARORLAR", "TOPSHIRIQLAR",
+                          "TOPSHIRIQLAR RO‘YXATI", "TOPSHIRIQLAR RO'YXATI",
+                          "MUHOKAMA", "QABUL QILINGAN QARORLAR")
+# keyword → rang (uzun variant oldin tekshiriladi)
+_PROTO_KEYWORDS = (
+    ("ESHITILDI", _PROTO_GREEN2), ("MUHOKAMA QILINDI", _PROTO_GREEN2),
+    ("QAROR QILINDI", _PROTO_GREEN), ("KELISHILDI", _PROTO_GREEN),
+    ("QAROR", _PROTO_GREEN), ("TOPSHIRIQ", _PROTO_AMBER),
+)
+
+
+def _proto_clean(line: str) -> str:
+    """Emoji va markdown belgilarini (**, ━, ─) tozalaydi."""
+    return (_PROTO_EMOJI_RE.sub("", line).replace("**", "")
+            .replace("━", "").replace("─", "").strip())
+
+
+def _proto_format_deadline(iso) -> str:
+    """Jadval 'Muddat' ustuni — sana yoki 'Aniqlashtirilsin' (null bo'lsa)."""
+    if not iso:
+        return "Aniqlashtirilsin"
+    try:
+        dt = datetime.fromisoformat(iso).astimezone(database.TZ)
+        return f"{dt.day}-{UZ_MONTHS_FULL[dt.month - 1]}"
+    except (ValueError, TypeError):
+        return str(iso)
+
+
+def _proto_tasks_from_actions(actions) -> list:
+    """create_task action'laridan jadval uchun topshiriqlarni ajratadi."""
+    out = []
+    for a in (actions or []):
+        if a.get("type") == "create_task":
+            d = a.get("data") or {}
+            out.append({"assignee": (d.get("assignee") or "").strip(),
+                        "title": (d.get("title") or "").strip(),
+                        "deadline": d.get("deadline")})
+    return out
+
+
+def _proto_tasks_from_text(protocol_text: str) -> list:
+    """Fallback: TOPSHIRIQ qatorlaridan jadval topshiriqlarini ajratadi
+    (saqlangan bayonnomani eksport qilganda actions bo'lmasa)."""
+    out = []
+    for raw in protocol_text.split("\n"):
+        c = _proto_clean(raw)
+        if c.upper().startswith("TOPSHIRIQ"):
+            rest = c[len("TOPSHIRIQ"):].lstrip(" :—-").strip()
+            if " — " in rest:
+                assignee, _, task = rest.partition(" — ")
+                out.append({"assignee": assignee.strip(), "title": task.strip(), "deadline": None})
+            elif rest:
+                out.append({"assignee": "", "title": rest, "deadline": None})
+    return out
+
+
+def _build_protocol_docx_bytes(title: str, protocol_text: str, tasks=None) -> bytes:
+    """Bayonnomani rasmiy, rang-kodli Word (.docx) hujjatga aylantiradi
+    (variant-2 dizayni): Arial 13pt, justify; yorliq/sarlavha/QAROR yashil,
+    ESHITILDI o'rta yashil, TOPSHIRIQ oltin, Izoh qizil; topshiriqlar jadvalda."""
+    import io
+    from docx import Document
+    from docx.shared import Pt, Cm, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
+    from docx.oxml.ns import qn
+
+    def _rgb(h):
+        return RGBColor(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+    GREEN = _rgb(_PROTO_GREEN)
+    doc = Document()
+    sec = doc.sections[0]
+    sec.left_margin = Cm(1.3); sec.right_margin = Cm(1.2)
+    sec.top_margin = Cm(1.9); sec.bottom_margin = Cm(1.9)
+    normal = doc.styles["Normal"]
+    normal.font.name = "Arial"; normal.font.size = Pt(13)
+    _rf = normal.element.get_or_add_rPr().get_or_add_rFonts()
+    for _a in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
+        _rf.set(qn(_a), "Arial")
+
+    def add_para(space=6, justify=True):
+        p = doc.add_paragraph()
+        if justify:
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        p.paragraph_format.space_before = Pt(space)
+        p.paragraph_format.space_after = Pt(space)
+        return p
+
+    def run(p, text, bold=False, italic=False, color=None):
+        r = p.add_run(text)
+        r.bold = bold; r.italic = italic
+        r.font.name = "Arial"
+        r._element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:cs"), "Arial")
+        if color is not None:
+            r.font.color.rgb = color
+        return r
+
+    def is_section(cu):
+        s = cu.rstrip(":").strip()
+        return any(s == h or s.startswith(h + " ") for h in _PROTO_SECTION_HEADERS)
+
+    in_kun = False
+    kun_n = 0
+    for raw in protocol_text.split("\n"):
+        was_bold = ("**" in raw) or bool(_PROTO_EMOJI_RE.match(raw.lstrip()[:2]))
+        c = _proto_clean(raw)
+        if not c:
+            add_para(space=2); in_kun = False; continue
+        cu = c.upper(); low = c.lower()
+
+        # Dekorativ sarlavha / ajratgich — variant-2 dizaynida yo'q, tashlab ketamiz
+        if "BAYONNOMA" in cu and ":" not in c and "—" not in c and len(c) < 32:
+            continue
+
+        # Izoh — qizil, bold + italic
+        if low.startswith("izoh"):
+            run(add_para(), c, bold=True, italic=True, color=_rgb(_PROTO_RED))
+            in_kun = False; continue
+
+        # Metadata yorlig'i (Sana va vaqt / Ishtirokchilar / Bayonnoma yurituvchi …)
+        meta_lbl = None
+        for lbl in _PROTO_META_LABELS:
+            if low.startswith(lbl) and (len(low) == len(lbl) or low[len(lbl)] in " —:-\t"):
+                meta_lbl = lbl; break
+        if meta_lbl:
+            value = c[len(meta_lbl):].lstrip(" —:-\t").strip()
+            p = add_para()
+            p.paragraph_format.tab_stops.add_tab_stop(Cm(5.0), WD_TAB_ALIGNMENT.LEFT)
+            run(p, c[:len(meta_lbl)], bold=True, color=GREEN)
+            if value:
+                run(p, "\t" + value)
+            in_kun = False; continue
+
+        # Bo'lim sarlavhasi
+        if is_section(cu):
+            run(add_para(), c, bold=True, color=GREEN)
+            in_kun = cu.rstrip(":").strip().startswith("KUN TARTIBI")
+            kun_n = 0
+            continue
+
+        # Keyword qatori (ESHITILDI / QAROR / TOPSHIRIQ …)
+        kw_hit = next(((kw, col) for kw, col in _PROTO_KEYWORDS if cu.startswith(kw)), None)
+        if kw_hit:
+            kw, col = kw_hit
+            content = c[len(kw):].lstrip(" :—-").strip()
+            p = add_para()
+            run(p, kw + "   ", bold=True, color=_rgb(col))
+            if content:
+                run(p, content)
+            in_kun = False; continue
+
+        # Raqamli mavzu sarlavhasi ("1. …", "1.1 …") — bold yashil
+        if was_bold and re.match(r"^\d+(\.\d+)*[.)]\s+\S", c):
+            run(add_para(), c, bold=True, color=GREEN)
+            in_kun = False; continue
+
+        # KUN TARTIBI bandlari — qayta raqamlangan ro'yxat (qora, oddiy)
+        if in_kun:
+            item = re.sub(r"^\s*(\d+[.)]|[•\-–*])\s*", "", c).strip()
+            kun_n += 1
+            p = add_para()
+            p.paragraph_format.left_indent = Cm(0.8)
+            run(p, f"{kun_n}.  {item}")
+            continue
+
+        # Oddiy ro'yxat bandi
+        if c[:1] in ("•", "-", "–", "*"):
+            run(add_para(), "•  " + c.lstrip("•-–* ").strip())
+            continue
+
+        # Oddiy matn
+        run(add_para(), c)
+
+    # ── TOPSHIRIQLAR RO'YXATI — jadval ──
+    table_tasks = (tasks if tasks else None) or _proto_tasks_from_text(protocol_text)
+    if table_tasks:
+        add_para(space=2)
+        run(add_para(), "TOPSHIRIQLAR RO‘YXATI", bold=True, color=GREEN)
+        tbl = doc.add_table(rows=1, cols=4)
+        try:
+            tbl.style = "Table Grid"
+        except KeyError:
+            pass
+        widths = [Cm(0.9), Cm(4.4), Cm(9.3), Cm(3.6)]
+        for i, h in enumerate(["№", "Mas'ul", "Topshiriq", "Muddat"]):
+            cell = tbl.rows[0].cells[i]
+            cell.paragraphs[0].text = ""
+            run(cell.paragraphs[0], h, bold=True, color=GREEN)
+        for idx, t in enumerate(table_tasks, 1):
+            cells = tbl.add_row().cells
+            vals = [str(idx), t.get("assignee") or "—",
+                    t.get("title") or "—", _proto_format_deadline(t.get("deadline"))]
+            for i, v in enumerate(vals):
+                cells[i].paragraphs[0].text = ""
+                run(cells[i].paragraphs[0], v)
+        for row in tbl.rows:
+            for i, w in enumerate(widths):
+                row.cells[i].width = w
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
 
 
 @router.callback_query(F.data.startswith("protocol:"))
@@ -9725,53 +11580,115 @@ async def handle_protocol_notes(message: Message, state: FSMContext, bot: Bot) -
     )
 
     pending_count = sum(1 for a in pending_actions if a.get("type") == "create_task")
-    confirm_label = "✅ Tasdiqlash"
-    if pending_count:
-        confirm_label = f"✅ Tasdiqlash ({pending_count} ta vazifa)"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text=confirm_label, callback_data=f"proto_ok:{mid}"),
-            InlineKeyboardButton(text="✏️ Tahrirlash", callback_data=f"proto_edit:{mid}"),
-        ],
-        [InlineKeyboardButton(text="📤 Ulashish", callback_data=f"proto_share:{mid}")],
-        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"meetingopen:{mid}")],
-    ])
-    await _safe_answer(message, protocol_text, parse_mode="Markdown", reply_markup=kb)
+    await state.update_data(proto_saved=False, proto_tasks_done=False, proto_pending_count=pending_count)
+    await _safe_answer(message, protocol_text, parse_mode="Markdown",
+                       reply_markup=_protocol_result_kb(mid, pending_count, saved=False, tasks_done=False))
 
 
 @router.callback_query(F.data.startswith("proto_ok:"))
 async def cb_protocol_confirm(query: CallbackQuery, state: FSMContext) -> None:
-    """Save protocol text + auto-create tasks from pending_actions."""
+    """Save the protocol text ONLY. Task creation is a SEPARATE, optional step
+    (📌 Vazifalarni qo'shish) — saving never auto-creates tasks."""
     mid = query.data.split(":", 1)[1]
     data = await state.get_data()
     protocol_text = data.get("protocol_text", "")
-    pending_actions = data.get("pending_actions") or []
-    await state.clear()
     if not protocol_text:
-        await query.answer("Bayonnoma topilmadi", show_alert=True)
+        await query.answer("Bayonnoma topilmadi — qayta yarating.", show_alert=True)
         return
-    # Persist protocol text in follow_up_actions (existing column, stores arbitrary text/JSON).
     await database.update_meeting(mid, {
         "follow_up_actions": [protocol_text],
         "followup_sent_at": datetime.now(database.TZ).isoformat(),
     })
-    created = await _execute_actions(pending_actions)
-    n_tasks = len(created.get("task", []))
-    await query.answer(f"✅ Saqlandi · {n_tasks} ta vazifa yaratildi" if n_tasks
-                       else "✅ Bayonnoma saqlandi")
-    meeting = await database.get_meeting(mid)
-    if meeting:
-        try:
-            await query.message.edit_text(
-                _format_meeting_card(meeting, show_date=True),
-                parse_mode="Markdown",
-                reply_markup=meeting_inline_actions(meeting),
-            )
-        except TelegramBadRequest:
-            await _safe_answer(query.message, _format_meeting_card(meeting, show_date=True),
-                                parse_mode="Markdown",
-                                reply_markup=meeting_inline_actions(meeting))
+    await state.update_data(proto_saved=True)
+    await query.answer("✅ Bayonnoma saqlandi")
+    try:
+        await query.message.edit_reply_markup(reply_markup=_protocol_result_kb(
+            mid, data.get("proto_pending_count", 0),
+            saved=True, tasks_done=data.get("proto_tasks_done", False)))
+    except TelegramBadRequest:
+        pass
+
+
+@router.callback_query(F.data.startswith("proto_tasks:"))
+async def cb_protocol_tasks(query: CallbackQuery, state: FSMContext) -> None:
+    """Create tasks from the protocol's topshiriqlar — separate, optional step."""
+    mid = query.data.split(":", 1)[1]
+    data = await state.get_data()
+    pending = data.get("pending_actions") or []
+    if not pending:
+        await query.answer("Vazifa topilmadi — bayonnomani qayta yarating.", show_alert=True)
+        return
+    created = await _execute_actions(pending)
+    n = len(created.get("task", []))
+    await state.update_data(proto_tasks_done=True)
+    await query.answer(f"✅ {n} ta vazifa qo'shildi" if n else "Vazifa qo'shilmadi")
+    try:
+        await query.message.edit_reply_markup(reply_markup=_protocol_result_kb(
+            mid, data.get("proto_pending_count", n),
+            saved=data.get("proto_saved", False), tasks_done=True))
+    except TelegramBadRequest:
+        pass
+
+
+@router.callback_query(F.data.startswith("proto_export:"))
+async def cb_protocol_export(query: CallbackQuery, state: FSMContext) -> None:
+    """Export the protocol as a Word (.docx) file. Uses the in-progress text from
+    state, or the saved protocol from the meeting record."""
+    mid = query.data.split(":", 1)[1]
+    data = await state.get_data()
+    text = (data.get("protocol_text") or "").strip()
+    title = "Bayonnoma"
+    m = await database.get_meeting(mid)
+    if m:
+        title = (m.get("title") or "Bayonnoma").strip()
+        if not text:
+            fu = m.get("follow_up_actions") or []
+            text = (fu[0] if (isinstance(fu, list) and fu) else str(fu or "")).strip()
+    if not text:
+        await query.answer("Bayonnoma topilmadi — avval saqlang.", show_alert=True)
+        return
+    await query.answer("📄 Tayyorlayapman…")
+    from aiogram.types import BufferedInputFile
+    try:
+        proto_tasks = _proto_tasks_from_actions(data.get("pending_actions"))
+        blob = _build_protocol_docx_bytes(title, text, tasks=proto_tasks)
+        fname = f"bayonnoma_{datetime.now(database.TZ).strftime('%Y-%m-%d')}.docx"
+        await query.message.answer_document(BufferedInputFile(blob, filename=fname),
+                                            caption="📄 Bayonnoma (Word)")
+    except Exception as e:
+        await query.message.answer(_humanize_error(e))
+
+
+@router.callback_query(F.data.startswith("viewproto:"))
+async def cb_view_protocol(query: CallbackQuery) -> None:
+    """Show the saved meeting protocol (bayonnoma) text — fixes 'generated but
+    can't find it later'. Stored in the meeting's follow_up_actions column."""
+    mid = query.data.split(":", 1)[1]
+    m = await database.get_meeting(mid)
+    if not m:
+        await query.answer("Uchrashuv topilmadi", show_alert=True)
+        return
+    fu = m.get("follow_up_actions") or []
+    if isinstance(fu, list) and fu:
+        text = fu[0] if (len(fu) == 1 and isinstance(fu[0], str)) else "\n".join(f"• {x}" for x in fu)
+    else:
+        text = str(fu or "").strip()
+    if not text.strip():
+        await query.answer("Bu uchrashuvda bayonnoma yo'q", show_alert=True)
+        return
+    await query.answer()
+    view_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📄 Word", callback_data=f"proto_export:{mid}"),
+         InlineKeyboardButton(text="📋 Nusxa", callback_data=f"proto_share:{mid}"),
+        InlineKeyboardButton(text="📤 Ulashish", switch_inline_query=f"proto:{mid}")],
+        [back_button(f"meetingopen:{mid}", "⬅️ Orqaga")],
+    ])
+    await _safe_answer(
+        query.message,
+        f"📄 **BAYONNOMA — {m.get('title', '')}**\n\n{text}",
+        parse_mode="Markdown",
+        reply_markup=view_kb,
+    )
 
 
 @router.callback_query(F.data.startswith("proto_edit:"))
@@ -9859,22 +11776,40 @@ async def handle_protocol_revision(message: Message, state: FSMContext, bot: Bot
             InlineKeyboardButton(text=confirm_label, callback_data=f"proto_ok:{mid}"),
             InlineKeyboardButton(text="✏️ Tahrirlash", callback_data=f"proto_edit:{mid}"),
         ],
-        [InlineKeyboardButton(text="📤 Ulashish", callback_data=f"proto_share:{mid}")],
+        [InlineKeyboardButton(text="📋 Nusxa", callback_data=f"proto_share:{mid}"),
+        InlineKeyboardButton(text="📤 Ulashish", switch_inline_query=f"proto:{mid}")],
         [InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"meetingopen:{mid}")],
     ])
     await _safe_answer(message, protocol_text, parse_mode="Markdown", reply_markup=kb)
 
 
+# NOTE: inline 'proto:' / 'txt:' share AND the general search are handled by the
+# SINGLE handle_inline_query() below. There must be exactly ONE @router.inline_query()
+# handler: previously a second catch-all handler offered the raw "proto:<id>" string
+# as a result, so sharing leaked "@bot proto:<id>" text into the chat instead of the
+# protocol (reported bug).
+
+
 @router.callback_query(F.data.startswith("proto_share:"))
 async def cb_protocol_share(query: CallbackQuery, state: FSMContext) -> None:
-    """Hand the protocol text off via the bot's existing share menu (forward-to-chat)."""
+    """Re-send the protocol as a clean, standalone forwardable message. Resolves
+    the text from FSM state (freshly generated) OR the saved meeting record —
+    the latter is needed when sharing from the central 'Bayonnomalar' list,
+    where the text isn't in state (reported: 'ulashish ishlamadi')."""
+    mid = query.data.split(":", 1)[1]
     data = await state.get_data()
-    protocol_text = data.get("protocol_text", "")
+    protocol_text = (data.get("protocol_text") or "").strip()
     if not protocol_text:
-        await query.answer("Bayonnoma topilmadi", show_alert=True)
+        m = await database.get_meeting(mid)
+        if m:
+            fu = m.get("follow_up_actions") or []
+            protocol_text = (fu[0] if (isinstance(fu, list) and fu) else str(fu or "")).strip()
+    if not protocol_text:
+        await query.answer("Bayonnoma topilmadi — avval saqlang.", show_alert=True)
         return
-    await query.answer("Matnni yuqorida nusxalab, kerakli chat'ga jo'nating.")
-    # Re-send the protocol as a standalone copyable message so the user can long-press → forward.
+    await query.answer("📤 Quyidagi xabarni uzun bosib → Forward qiling.")
+    # Standalone copyable/forwardable message (inline buttons don't forward, so a
+    # clean text-only copy is the shareable artifact).
     await _safe_answer(query.message, protocol_text, parse_mode="Markdown")
 
 
@@ -9953,7 +11888,7 @@ async def cb_reopen(query: CallbackQuery) -> None:
         if task:
             try:
                 await query.message.edit_text(_format_task_card(task), parse_mode="Markdown",
-                                              reply_markup=task_inline_actions(task))
+                                              reply_markup=_task_card_kb_with_back(task))
             except Exception:
                 pass
     else:
@@ -10020,6 +11955,7 @@ async def cb_edit_field(query: CallbackQuery, state: FSMContext) -> None:
         "title": "📝 Yangi **sarlavha** yuboring (matn yoki ovoz):",
         "description": "📄 Yangi **tavsif** yuboring (yoki `-` deb yozsangiz tozalanadi):",
         "tags": "🏷 **Teglar** vergul bilan ajratib yuboring (masalan: `marketing, urgent`):",
+        "category": "📁 **Kategoriya** yuboring (masalan: `Shartnomalar`; `-` = tozalash):",
     }
     prompt = prompts.get(field)
     if not prompt:
@@ -10160,6 +12096,8 @@ async def handle_edit_value(message: Message, state: FSMContext) -> None:
     elif field == "tags":
         tags = [t.strip() for t in raw.split(",") if t.strip()]
         await database.update_task(tid, {"tags": tags}, source="edit")
+    elif field == "category":
+        await database.update_task(tid, {"category": None if raw == "-" else raw[:60]}, source="edit")
     elif field == "deadline":
         # Try to parse via Claude (consistent with how user-input dates are parsed)
         parsed, reason = await _parse_deadline_natural(raw)
@@ -10280,15 +12218,22 @@ async def _parse_deadline_natural(text: str) -> tuple[str | None, str | None]:
 
 
 def _task_card_kb_with_back(task: dict) -> InlineKeyboardMarkup:
-    """Opened task card — intentionally minimal: just ⋯ Batafsil and ⬅️ Ro'yxatga.
-    Every per-task action (Ijrochi, Bajarildi, Muddat, Tahrir, O'chirish, …) lives
-    inside ⋯ Batafsil (task_detail_menu), so we don't duplicate them on the card."""
+    """Opened task card — direct actions, NO extra '⋯ Batafsil' step:
+    [✅ Bajarildi / ↺ Qaytarish] [✏️ Tahrir] [🗑 O'chirish], then ⬅️ Ro'yxatga (back to
+    the filter the card was opened from). Field edits + 👤 Ijrochi live under ✏️ Tahrir."""
     tid = task["id"]
+    back = f"taskfilter:{_last_task_filter or 'active'}"
+    if task.get("status") == "done":
+        primary = InlineKeyboardButton(text="↺ Qaytarish", callback_data=f"reopen:{tid}")
+    else:
+        primary = InlineKeyboardButton(text="✅ Bajarildi", callback_data=f"complete:{tid}")
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="⋯ Batafsil", callback_data=f"task_detail:{tid}"),
-            InlineKeyboardButton(text="⬅️ Ro'yxatga", callback_data="taskfilter:active"),
+            primary,
+            InlineKeyboardButton(text="✏️ Tahrir", callback_data=f"edit:{tid}"),
+            InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"task_del:{tid}"),
         ],
+        [InlineKeyboardButton(text="⬅️ Ro'yxatga", callback_data=back)],
     ])
 
 
@@ -10302,71 +12247,102 @@ async def cb_fallback(query: CallbackQuery) -> None:
 
 @router.inline_query()
 async def handle_inline_query(query: InlineQuery) -> None:
-    """Inline mode: `@bot <q>` from any chat. Only the principal sees results.
+    """The SINGLE inline handler (principal only). Three query shapes:
+      • 'proto:<meeting_id>' → that meeting's saved protocol (clean, sendable text)
+      • 'txt:<token>'        → a cached polished text
+      • anything else        → raw text + task/meeting quick-search
 
-    Results:
-      - Direct text result (whatever the principal typed) — they can send as-is
-      - If query matches a task title, offer that task's title as a quick send
-      - If query matches a meeting, offer that meeting's summary
-    """
-    if not _is_principal(query.from_user.id):
+    All results use parse_mode=None so a protocol's stray markdown/emoji never makes
+    answerInlineQuery fail. A 'proto:'/'txt:' miss shows "Topilmadi" — NEVER the raw
+    "proto:<id>" string (that was the leaked-text bug).
+
+    NOTE: inline share needs inline mode ENABLED in @BotFather (/setinline). When it's
+    off, Telegram sends no inline_query and "@bot proto:<id>" would be sent as plain
+    text — so if results never appear, check BotFather first."""
+    uid = query.from_user.id if query.from_user else None
+    if not _is_principal(uid):
         await query.answer(results=[], cache_time=1, is_personal=True)
         return
 
     q = (query.query or "").strip()
-    results = []
-
-    # Always offer raw text as result #0 so principal can use the bot as a quick scratchpad
-    if q:
-        results.append(InlineQueryResultArticle(
-            id="raw",
-            title=f"📝 «{q[:60]}»",
-            description="Bu matnni shu chatga jo'natish",
-            input_message_content=InputTextMessageContent(message_text=q),
-        ))
-
-    # If query is at least 2 chars, search tasks/meetings/contacts
-    if len(q) >= 2:
-        try:
-            search_results = await database.search_all(q, limit=8)
-            for t in search_results.get("tasks", [])[:5]:
-                badge = _task_badge(t)  # unified with the list — same dot for the same task
-                deadline_label, _ = _format_deadline_short(t.get("deadline"))
+    results: list = []
+    try:
+        if q.startswith("proto:"):
+            mid = q.split(":", 1)[1]
+            m = await database.get_meeting(mid)
+            if m:
+                fu = m.get("follow_up_actions") or []
+                text = (fu[0] if (isinstance(fu, list) and fu) else str(fu or "")).strip()
+                if text:
+                    results.append(InlineQueryResultArticle(
+                        id=f"p-{mid}"[:64],
+                        title="📄 Bayonnomani yuborish",
+                        description=(m.get("title") or "Bayonnoma").strip()[:80],
+                        input_message_content=InputTextMessageContent(
+                            message_text=text.replace("**", "")[:4096], parse_mode=None),
+                    ))
+        elif q.startswith("txt:"):
+            token = q.split(":", 1)[1]
+            text = await database.get_share_text(token)
+            if text:
                 results.append(InlineQueryResultArticle(
-                    id=f"task:{t['id']}",
-                    title=f"{badge} {_truncate(t['title'], 60)}",
-                    description=f"Vazifa · {deadline_label}",
+                    id=f"t-{token}"[:64],
+                    title="📤 Matnni yuborish",
+                    description=text[:80],
                     input_message_content=InputTextMessageContent(
-                        message_text=f"{badge} {t['title']}\n📅 {deadline_label}"
-                    ),
+                        message_text=text[:4096], parse_mode=None),
                 ))
-            for m in search_results.get("meetings", [])[:3]:
-                try:
-                    dt = datetime.fromisoformat(m["datetime_start"]).astimezone(database.TZ)
-                    time_str = dt.strftime("%d-%m %H:%M")
-                except (ValueError, TypeError):
-                    time_str = "—"
-                participants = ", ".join(m.get("participants", [])[:2]) or "—"
+        else:
+            # Raw text as a quick scratchpad result.
+            if q:
                 results.append(InlineQueryResultArticle(
-                    id=f"meeting:{m['id']}",
-                    title=f"🤝 {_truncate(m['title'], 60)}",
-                    description=f"Uchrashuv · {time_str} · {participants}",
-                    input_message_content=InputTextMessageContent(
-                        message_text=f"🤝 {m['title']}\n🕐 {time_str}\n👥 {participants}"
-                    ),
+                    id="raw",
+                    title=f"📝 «{q[:60]}»",
+                    description="Bu matnni shu chatga jo'natish",
+                    input_message_content=InputTextMessageContent(message_text=q, parse_mode=None),
                 ))
-        except Exception:
-            logger.exception("Inline search failed")
+            # Task/meeting quick-search.
+            if len(q) >= 2:
+                search_results = await database.search_all(q, limit=8)
+                for t in search_results.get("tasks", [])[:5]:
+                    badge = _task_badge(t)
+                    deadline_label, _ = _format_deadline_short(t.get("deadline"))
+                    results.append(InlineQueryResultArticle(
+                        id=f"task:{t['id']}"[:64],
+                        title=f"{badge} {_truncate(t['title'], 60)}",
+                        description=f"Vazifa · {deadline_label}",
+                        input_message_content=InputTextMessageContent(
+                            message_text=f"{badge} {t['title']}\n📅 {deadline_label}", parse_mode=None),
+                    ))
+                for m in search_results.get("meetings", [])[:3]:
+                    try:
+                        dt = datetime.fromisoformat(m["datetime_start"]).astimezone(database.TZ)
+                        time_str = dt.strftime("%d-%m %H:%M")
+                    except (ValueError, TypeError):
+                        time_str = "—"
+                    participants = ", ".join(m.get("participants", [])[:2]) or "—"
+                    results.append(InlineQueryResultArticle(
+                        id=f"meeting:{m['id']}"[:64],
+                        title=f"🤝 {_truncate(m['title'], 60)}",
+                        description=f"Uchrashuv · {time_str} · {participants}",
+                        input_message_content=InputTextMessageContent(
+                            message_text=f"🤝 {m['title']}\n🕐 {time_str}\n👥 {participants}", parse_mode=None),
+                    ))
+    except Exception:
+        logger.exception("Inline query handler failed")
 
     if not results:
+        is_share = q.startswith(("proto:", "txt:"))
         results.append(InlineQueryResultArticle(
             id="empty",
-            title="Hech narsa topilmadi",
-            description="Boshqa kalit so'z bilan urinib ko'ring",
-            input_message_content=InputTextMessageContent(message_text="(qidiruv natijasi yoʻq)"),
+            title="Topilmadi",
+            description=("Bayonnoma topilmadi — avval saqlang." if is_share
+                         else "Boshqa kalit so'z bilan urinib ko'ring"),
+            input_message_content=InputTextMessageContent(
+                message_text="(natija yo'q)", parse_mode=None),
         ))
 
-    await query.answer(results=results, cache_time=2, is_personal=True)
+    await query.answer(results=results, cache_time=1, is_personal=True)
 
 
 # ─────────────────────── FALLBACK HANDLERS (last-resort) ───────────────────────
@@ -10412,14 +12388,12 @@ async def handle_voice_fallback(message: Message, bot: Bot, state: FSMContext) -
         await _process_and_reply(message, transcript, state=state)
 
 
-@router.message(F.photo | F.document | F.video | F.video_note | F.sticker | F.animation | F.audio)
+@router.message(F.video | F.video_note | F.sticker | F.animation | F.audio)
 async def handle_unsupported_attachment(message: Message) -> None:
     """Polite "not yet supported" instead of silent drop for media types the
-    bot has no handler for. Helps the user know the bot is alive and what
-    DOES work."""
+    bot has no handler for. Documents and photos are handled by
+    handle_incoming_file; this covers video/sticker/animation/audio."""
     kind = (
-        "rasm" if message.photo else
-        "hujjat" if message.document else
         "video" if message.video else
         "video-xabar" if message.video_note else
         "stiker" if message.sticker else

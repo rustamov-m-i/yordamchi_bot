@@ -52,6 +52,20 @@ def _invalidate_cache() -> None:
         _cached_at = 0.0
 
 
+def _is_transient_icloud_error(e: BaseException) -> bool:
+    """True for read-stall / timeout / connection-drop errors — the expected,
+    self-healing failures on a flaky laptop link (Apple HTTP/3 quirk, wifi/sleep,
+    stale cached connection). These are logged concisely (no traceback) since the
+    next sweep retries on a fresh connection. Auth/permission errors are NOT
+    transient and stay loud (handled in _get_calendar_cached / push paths)."""
+    s = (str(e) + " " + type(e).__name__).lower()
+    return any(k in s for k in (
+        "timeout", "timed out", "connection reset", "connection aborted",
+        "max retries", "name or service not known", "temporarily unavailable",
+        "remotedisconnected", "connectionerror", "protocolerror",
+    ))
+
+
 def _connect() -> Optional[caldav.DAVClient]:
     if not config.ICLOUD_ENABLED:
         return None
@@ -316,8 +330,18 @@ def _sync_events_to_db_sync() -> int:
 
     try:
         events = cal.date_search(start=now, end=end, expand=True)
-    except Exception:
-        logger.exception("iCloud date_search failed")
+    except Exception as e:
+        # Drop the cached connection so the NEXT sweep reconnects fresh (a stale
+        # connection is the usual cause of a 30s read-stall after the laptop's
+        # network changed). Log transient timeouts concisely — one warning line,
+        # not a full traceback every minute. Unexpected errors keep more detail.
+        _invalidate_cache()
+        if _is_transient_icloud_error(e):
+            logger.warning("iCloud sync skipped (transient connection issue: %s) — "
+                           "cache reset, will retry next sweep", type(e).__name__)
+        else:
+            logger.warning("iCloud date_search failed: %s: %s",
+                           type(e).__name__, str(e)[:160])
         return 0
 
     imported = 0
